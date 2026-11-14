@@ -3,7 +3,7 @@
 ;; Author: sam kleinman <sam@tychoish.com>
 ;; Maintainer: sam kleinman <sam@tychoish.com>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "29.1") (jsonl "0.0.1"))
 ;; Keywords: tools, convenience, files
 ;; URL: https://github.com/tychoish/logx
 
@@ -16,10 +16,12 @@
 ;; Features:
 ;; - Interactive inspection for arbitrary `.jsonl` and `.ndjson` files.
 ;; - In-place collapsible disclosure widgets (`TAB` / `S-TAB`) for nested objects and long strings.
+;; - Dedicated "info" view inspector buffer (`*logx-info*`) pretty-printing single lines in `json-ts-mode`.
+;; - Tree-sitter accelerated AST parsing and syntactic punctuation concealment.
 ;; - Dynamic timestamp format cycling (wall-clock, time-of-day, relative delta).
 ;; - High-performance zero-copy severity and category filtering using `buffer-invisibility-spec`.
 ;; - Pluggable schema projection heuristics for logs and generic JSON datasets.
-;; - Live streaming and in-memory ring buffer viewer support.
+;; - Live streaming and in-memory ring buffer viewer support with multi-buffer routing (`*logs:<filter>*`).
 
 ;;; Code:
 

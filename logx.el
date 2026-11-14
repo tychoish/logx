@@ -3,7 +3,7 @@
 ;; Author: sam kleinman <sam@tychoish.com>
 ;; Maintainer: sam kleinman <sam@tychoish.com>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "29.1") (jsonl "0.0.1"))
 ;; Keywords: tools, convenience, logging
 ;; URL: https://github.com/tychoish/logx
 
@@ -17,6 +17,7 @@
 ;; - Zero-cost disabled logging fast-path via severity gating macros.
 ;; - Compile-time call-site source tracking via `symbols-with-pos`.
 ;; - In-memory fixed-capacity circular ring buffer.
+;; - Multi-buffer filtered dispatching (*logs*, *logs:<filter>*, *logs:<category>*).
 ;; - Fast C-level JSON Lines (`json-serialize`) disk appender with object sanitization.
 ;; - Optional message-quarantine mode to silence chatty background subsystems.
 
