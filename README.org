@@ -11,15 +11,23 @@ High-performance, zero-allocation structured logging and line-oriented JSON view
 :CUSTOM_ID: overview
 :END:
 
-=logx= provides a high-performance structured logging pipeline and interactive log viewer
-ecosystem for GNU Emacs. It is built strictly on the Emacs 29+ standard library primitives
-(=json.c=, =ring.el=, =map.el=, =cl-lib=) with zero external package dependencies.
+=logx= provides a high-performance structured logging pipeline, pluggable multi-output
+backends, and an interactive log viewer ecosystem for GNU Emacs. It is built strictly on
+GNU Emacs 29+ standard library primitives (=json.c=, =ring.el=, =map.el=, =cl-lib=) with
+zero external package dependencies.
 
 ** Features
-- *Zero-Allocation Disabled Paths*: Bitmask severity gating evaluates in ~1.4 µs with zero allocations when below active threshold.
-- *Standard Library Circular Buffer*: Uses core =ring.el= for O(1) in-memory retention without custom vector pointer bookkeeping.
+- *Zero-Allocation Disabled Paths*: Bitmask severity gating evaluates in ~0.4 µs with zero allocations when below active threshold.
+- *Primary Ingress In-Memory Ring Buffer*: Uses core =ring.el= for O(1) in-memory retention (~3.9 µs latency) without custom vector pointer bookkeeping.
+- *Pluggable Output Backends*:
+  - *Ring Buffer* (=ring=): Primary in-memory circular storage; always active.
+  - *JSON Lines File* (=file=): Atomic batch-flushed log file writer.
+  - *systemd-journald* (=journald=): Direct Unix domain datagram socket writer (=/run/systemd/journal/socket=) with structured metadata.
+  - *Legacy syslog* (=syslog=): Standard RFC 3164 datagram socket writer (=/dev/log=).
+  - *Custom Backends*: Register arbitrary batch dispatchers via =logx-register-backend=.
+- *Asynchronous Batch Flushing & Backpressure*: Decouples disk/socket I/O from the UI thread using background timer or thread transports (~55x faster than synchronous writes under pressure), guarded with configurable backpressure policies (=:drop-oldest= or =:yield=).
 - *Strict Architectural Decoupling*:
-  - =logx.el=: Core structured logger, severity macros, ring buffer, subscriber dispatch, and atomic append-only disk writer. Completely headless.
+  - =logx.el=: Core structured logger, severity macros, ring buffer, backend registry, and async engine. Completely headless.
   - =jsonl-view.el=: Generic, high-performance line-oriented JSON viewer with inline expandable disclosure widgets and full-record detail buffer (=*jsonl-info*=). Contains zero log concepts.
   - =logx-view.el=: Specialized log viewer layered on =jsonl-view-mode=. Provides semantic faces (inheriting cleanly from standard faces without hardcoded hex colors), interactive level/category filtering, timestamp display cycling, and live throttled streaming.
   - =logx-alert.el=: Optional integration sink routing =alert.el= notifications into =logx=.
@@ -84,10 +92,14 @@ git clone https://github.com/tychoish/logx.git ~/src/logx
   :init
   ;; Default minimum severity threshold
   (setq logx-default-level 'info)
-  ;; Optional: specify persistent disk log sink
-  (setq logx-log-file (expand-file-name "logs/emacs.jsonl" user-emacs-directory))
   ;; Retain 10,000 events in memory
-  (setq logx-ring-buffer-size 10000))
+  (setq logx-ring-buffer-size 10000)
+  ;; Optional: persistent disk log sink
+  (setq logx-log-file (expand-file-name "logs/emacs.jsonl" user-emacs-directory))
+  ;; Enable asynchronous batch flushing (recommended)
+  (setq logx-async-mode t
+        logx-async-transport 'timer
+        logx-async-flush-interval 0.05))
 
 (use-package jsonl-view
   :defer t
@@ -114,8 +126,14 @@ git clone https://github.com/tychoish/logx.git ~/src/logx
 |--------+------+---------+-------------|
 | ~logx-default-level~ | symbol | ='info= | Global minimum logging severity threshold |
 | ~logx-category-levels~ | alist | =nil= | Category-specific threshold overrides |
-| ~logx-log-file~ | string/nil | =nil= | Path for appending JSON Lines records to disk |
 | ~logx-ring-buffer-size~ | integer | =10000= | Max events retained in circular ring buffer |
+| ~logx-log-file~ | string/nil | =nil= | Path for appending JSON Lines records to disk |
+| ~logx-async-mode~ | boolean | =t= | Enable non-blocking asynchronous batch flushing |
+| ~logx-async-transport~ | symbol | ='timer= | Async engine: ='timer=, ='thread=, or ='sync= |
+| ~logx-async-flush-interval~ | number | =0.05= | Seconds between batch flushes |
+| ~logx-async-max-queue~ | integer | =10000= | Backpressure queue capacity |
+| ~logx-journald-socket~ | string | =/run/systemd/journal/socket= | Path to systemd-journald datagram socket |
+| ~logx-syslog-socket~ | string | =/dev/log= | Path to syslog datagram socket |
 | ~logx-quarantined-packages~ | list | ='("eglot" "flymake" "magit" "eldoc")= | Packages intercepted by =logx-quarantine-mode= |
 | ~jsonl-view-truncate-length~ | integer | =80= | Max string length before inline disclosure widget |
 
@@ -144,6 +162,30 @@ Emit structured events with key-value pairs. Keys can be keyword symbols, string
 (logx-critical :cat 'billing :msg "Gateway unresponsive" :retries 3)
 (logx-alert :cat 'security :msg "Multiple failed authentications" :target "admin")
 (logx-fatal :cat 'system :msg "Out of memory" :free-bytes 0)
+#+END_SRC
+
+** Pluggable Output Backends
+:PROPERTIES:
+:CUSTOM_ID: pluggable-output-backends
+:END:
+
+By default, events are written immediately to the primary in-memory ring buffer. Additional
+destinations can be enabled or registered dynamically:
+
+#+BEGIN_SRC emacs-lisp
+;; Enable direct socket delivery to systemd-journald
+(logx-enable-backend 'journald)
+
+;; Enable direct RFC 3164 socket delivery to syslog
+(logx-enable-backend 'syslog)
+
+;; Register a custom telemetry backend
+(logx-register-backend 'cloud-telemetry
+  (lambda (events)
+    (message "Forwarding %d events to remote collector" (length events))))
+
+;; Synchronously flush all pending asynchronous writes immediately
+(logx-flush)
 #+END_SRC
 
 ** Viewing Logs Interactively
@@ -192,6 +234,20 @@ Quarantine noisy echo area messages into structured events:
 (logx-quarantine-mode 1)
 #+END_SRC
 
+* Performance & Benchmarks
+:PROPERTIES:
+:CUSTOM_ID: performance-and-benchmarks
+:END:
+
+Comprehensive comparative benchmarks against =log4e=, =elog=, =emacs-lgr=, and built-in
+primitives are detailed in [[file:docs/benchmarks.org][docs/benchmarks.org]].
+
+Key benchmark highlights on GNU Emacs 31.1:
+- *Disabled Macro Gating*: ~2,463,000 ops/sec (~0.4 µs/op) with zero allocations.
+- *Active In-Memory Ring Logging*: ~253,500 ops/sec (~3.9 µs/op) — within 1 µs of C =message=.
+- *Async Batch Flushing vs Sync Disk Writes*: Async flushing achieves ~253,500 ops/sec under pressure (*53x faster* than synchronous disk writes at ~4,760 ops/sec).
+- *Comparison to Existing Libraries*: =logx= is *10x to 20x faster* than =emacs-lgr=, =elog=, and =log4e=.
+
 * API Reference
 :PROPERTIES:
 :CUSTOM_ID: api-reference
@@ -211,6 +267,18 @@ Quarantine noisy echo area messages into structured events:
 | [[#logx-category-levels][~logx-category-levels~]] | Custom | Alist mapping category symbols to severity thresholds |
 | [[#logx-log-file][~logx-log-file~]] | Custom | File path for appending JSON Lines log records |
 | [[#logx-ring-buffer-size][~logx-ring-buffer-size~]] | Custom | Maximum structured events retained in circular buffer |
+| [[#logx-async-mode][~logx-async-mode~]] | Custom | When non-nil, flush events to disk/network asynchronously |
+| [[#logx-async-transport][~logx-async-transport~]] | Custom | Transport driving asynchronous flushing: timer, thread, sync |
+| [[#logx-async-flush-interval][~logx-async-flush-interval~]] | Custom | Interval in seconds between asynchronous batch flushes |
+| [[#logx-async-max-queue][~logx-async-max-queue~]] | Custom | Maximum pending events retained in async queue |
+| [[#logx-journald-socket][~logx-journald-socket~]] | Custom | Path to systemd-journald Unix domain datagram socket |
+| [[#logx-syslog-socket][~logx-syslog-socket~]] | Custom | Path to Unix domain syslog datagram socket |
+| [[#logx-flush][~logx-flush~]] | Command | Synchronously flush all pending events in async queue |
+| [[#logx-register-backend][~logx-register-backend~]] | Function | Register backend ID with batch handler function |
+| [[#logx-unregister-backend][~logx-unregister-backend~]] | Function | Unregister backend ID |
+| [[#logx-enable-backend][~logx-enable-backend~]] | Function | Enable backend ID |
+| [[#logx-disable-backend][~logx-disable-backend~]] | Function | Disable backend ID |
+| [[#logx-backend-enabled-p][~logx-backend-enabled-p~]] | Function | Return non-nil if backend ID is registered and enabled |
 | [[#logx-quarantined-packages][~logx-quarantined-packages~]] | Custom | List of package prefix strings whose message calls are intercepted |
 | [[#logx-quarantine-mode][~logx-quarantine-mode~]] | Command | Global minor mode diverting background package messages to logx |
 | [[#logx-set-category-level][~logx-set-category-level~]] | Function | Set threshold for category to level |
@@ -253,6 +321,9 @@ Do not edit the #+RESULTS: block by hand.
                    (expand-file-name "logx-alert.el"))
    :scope '("logx-debug" "logx-info" "logx-notice" "logx-warn" "logx-error" "logx-critical" "logx-alert" "logx-fatal"
             "logx-default-level" "logx-category-levels" "logx-log-file" "logx-ring-buffer-size"
+            "logx-async-mode" "logx-async-transport" "logx-async-flush-interval" "logx-async-max-queue"
+            "logx-journald-socket" "logx-syslog-socket" "logx-flush"
+            "logx-register-backend" "logx-unregister-backend" "logx-enable-backend" "logx-disable-backend" "logx-backend-enabled-p"
             "logx-quarantined-packages" "logx-quarantine-mode" "logx-set-category-level"
             "logx-register-subscriber" "logx-unregister-subscriber" "logx-show-logs" "logx-fork-filtered-buffer"
             "jsonl-view-mode" "jsonl-view-toggle-info" "jsonl-view-copy-as-json"
@@ -266,56 +337,56 @@ Do not edit the #+RESULTS: block by hand.
 #+END_SRC
 
 #+RESULTS:
-** [[file:logx.el::358][logx-debug]]
+** [[file:logx.el::647][logx-debug]]
 :PROPERTIES:
 :CUSTOM_ID: logx-debug
 :END:
 
 Emit a DEBUG level log event. ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs.
 
-** [[file:logx.el::364][logx-info]]
+** [[file:logx.el::653][logx-info]]
 :PROPERTIES:
 :CUSTOM_ID: logx-info
 :END:
 
 Emit an INFO level log event. ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs.
 
-** [[file:logx.el::370][logx-notice]]
+** [[file:logx.el::659][logx-notice]]
 :PROPERTIES:
 :CUSTOM_ID: logx-notice
 :END:
 
 Emit a NOTICE level log event. ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs.
 
-** [[file:logx.el::376][logx-warn]]
+** [[file:logx.el::665][logx-warn]]
 :PROPERTIES:
 :CUSTOM_ID: logx-warn
 :END:
 
 Emit a WARN level log event. ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs.
 
-** [[file:logx.el::382][logx-error]]
+** [[file:logx.el::671][logx-error]]
 :PROPERTIES:
 :CUSTOM_ID: logx-error
 :END:
 
 Emit an ERROR level log event. ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs.
 
-** [[file:logx.el::388][logx-critical]]
+** [[file:logx.el::677][logx-critical]]
 :PROPERTIES:
 :CUSTOM_ID: logx-critical
 :END:
 
 Emit a CRITICAL level log event. ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs.
 
-** [[file:logx.el::394][logx-alert]]
+** [[file:logx.el::683][logx-alert]]
 :PROPERTIES:
 :CUSTOM_ID: logx-alert
 :END:
 
 Emit an ALERT level log event. ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs.
 
-** [[file:logx.el::400][logx-fatal]]
+** [[file:logx.el::689][logx-fatal]]
 :PROPERTIES:
 :CUSTOM_ID: logx-fatal
 :END:
@@ -350,6 +421,90 @@ File path for appending JSON Lines log records, or nil to disable disk sink.
 
 Maximum number of structured events retained in the circular ring buffer.
 
+** logx-async-mode
+:PROPERTIES:
+:CUSTOM_ID: logx-async-mode
+:END:
+
+When non-nil, flush events to disk and network backends asynchronously.
+
+** logx-async-transport
+:PROPERTIES:
+:CUSTOM_ID: logx-async-transport
+:END:
+
+Transport driving asynchronous flushing: ‘timer’, ‘thread’, or ‘sync’.
+
+** logx-async-flush-interval
+:PROPERTIES:
+:CUSTOM_ID: logx-async-flush-interval
+:END:
+
+Interval in seconds between asynchronous batch flushes.
+
+** logx-async-max-queue
+:PROPERTIES:
+:CUSTOM_ID: logx-async-max-queue
+:END:
+
+Maximum pending events retained in the async queue before applying backpressure.
+
+** logx-journald-socket
+:PROPERTIES:
+:CUSTOM_ID: logx-journald-socket
+:END:
+
+Path to systemd-journald Unix domain datagram socket.
+
+** logx-syslog-socket
+:PROPERTIES:
+:CUSTOM_ID: logx-syslog-socket
+:END:
+
+Path to Unix domain syslog datagram socket.
+
+** [[file:logx.el::488][logx-flush]] :command:
+:PROPERTIES:
+:CUSTOM_ID: logx-flush
+:END:
+
+Synchronously flush all pending events in the async queue to active backends.
+
+** [[file:logx.el::313][logx-register-backend]]
+:PROPERTIES:
+:CUSTOM_ID: logx-register-backend
+:END:
+
+Register backend ID with batch HANDLER function. HANDLER is called with a list of event plists: (funcall HANDLER events).
+
+** [[file:logx.el::321][logx-unregister-backend]]
+:PROPERTIES:
+:CUSTOM_ID: logx-unregister-backend
+:END:
+
+Unregister backend ID.
+
+** [[file:logx.el::326][logx-enable-backend]]
+:PROPERTIES:
+:CUSTOM_ID: logx-enable-backend
+:END:
+
+Enable backend ID.
+
+** [[file:logx.el::333][logx-disable-backend]]
+:PROPERTIES:
+:CUSTOM_ID: logx-disable-backend
+:END:
+
+Disable backend ID.
+
+** [[file:logx.el::340][logx-backend-enabled-p]]
+:PROPERTIES:
+:CUSTOM_ID: logx-backend-enabled-p
+:END:
+
+Return non-nil if backend ID is registered and enabled.
+
 ** logx-quarantined-packages
 :PROPERTIES:
 :CUSTOM_ID: logx-quarantined-packages
@@ -357,28 +512,28 @@ Maximum number of structured events retained in the circular ring buffer.
 
 List of package prefix strings whose ~message~ calls are intercepted.
 
-** [[file:logx.el::456][logx-quarantine-mode]] :command:
+** [[file:logx.el::745][logx-quarantine-mode]] :command:
 :PROPERTIES:
 :CUSTOM_ID: logx-quarantine-mode
 :END:
 
 Global minor mode diverting background package messages to logx.
 
-** [[file:logx.el::100][logx-set-category-level]]
+** [[file:logx.el::138][logx-set-category-level]]
 :PROPERTIES:
 :CUSTOM_ID: logx-set-category-level
 :END:
 
 Set threshold for CATEGORY to LEVEL.
 
-** [[file:logx.el::286][logx-register-subscriber]]
+** [[file:logx.el::576][logx-register-subscriber]]
 :PROPERTIES:
 :CUSTOM_ID: logx-register-subscriber
 :END:
 
 Register subscriber ID with HANDLER function called on each event.
 
-** [[file:logx.el::293][logx-unregister-subscriber]]
+** [[file:logx.el::583][logx-unregister-subscriber]]
 :PROPERTIES:
 :CUSTOM_ID: logx-unregister-subscriber
 :END:
@@ -516,14 +671,14 @@ Alist mapping standard semantic keys to candidate JSON property names.
 :CUSTOM_ID: logx-alert-sink
 :END:
 
-Route ~alert~ notification INFO plist into ‘logx’ structured logging.
+Route ‘alert’ notification INFO plist into ‘logx’ structured logging.
 
 ** [[file:logx-alert.el::41][logx-alert-register]]
 :PROPERTIES:
 :CUSTOM_ID: logx-alert-register
 :END:
 
-Register ‘logx’ style with ~alert~ if alert is loaded.
+Register ‘logx’ style with ‘alert’ if alert is loaded.
 
 * Development
 :PROPERTIES:
@@ -536,10 +691,10 @@ Run the ERT test suite locally:
 emacs -batch -L . -l test/test-logx.el -l test/test-jsonl-view.el -l test/test-logx-alert.el -l test/test-logx-view.el -f ert-run-tests-batch-and-exit
 #+END_SRC
 
-Run performance benchmarks:
+Run comparative performance benchmarks:
 
 #+BEGIN_SRC bash
-emacs -batch -L . -l bench/benchmark-logx.el
+emacs -batch -L . -l bench/comparative-benchmarks.el -f run-comparative-benchmarks
 #+END_SRC
 
 * License

@@ -78,6 +78,44 @@
                  (file :tag "File Path"))
   :group 'logx)
 
+(defcustom logx-async-mode t
+  "When non-nil, flush events to disk and network backends asynchronously."
+  :type 'boolean
+  :group 'logx)
+
+(defcustom logx-async-transport 'timer
+  "Transport driving asynchronous flushing: `timer', `thread', or `sync'."
+  :type '(choice (const :tag "Timer-driven (recommended)" timer)
+                 (const :tag "Native thread" thread)
+                 (const :tag "Synchronous" sync))
+  :group 'logx)
+
+(defcustom logx-async-flush-interval 0.05
+  "Interval in seconds between asynchronous batch flushes."
+  :type 'number
+  :group 'logx)
+
+(defcustom logx-async-max-queue 10000
+  "Maximum pending events retained in the async queue before applying backpressure."
+  :type 'integer
+  :group 'logx)
+
+(defcustom logx-async-backpressure-policy :drop-oldest
+  "Backpressure strategy when async queue is full: `:drop-oldest' or `:yield'."
+  :type '(choice (const :tag "Drop oldest pending events (non-blocking)" :drop-oldest)
+                 (const :tag "Yield execution to worker" :yield))
+  :group 'logx)
+
+(defcustom logx-journald-socket "/run/systemd/journal/socket"
+  "Path to systemd-journald Unix domain datagram socket."
+  :type 'string
+  :group 'logx)
+
+(defcustom logx-syslog-socket "/dev/log"
+  "Path to Unix domain syslog datagram socket."
+  :type 'string
+  :group 'logx)
+
 (defcustom logx-sanitize-max-depth 8
   "Maximum recursion depth when sanitizing complex Lisp objects."
   :type 'integer
@@ -264,16 +302,256 @@ If LIMIT is non-nil, return at most LIMIT entries."
                         :data sanitized-data)))
     (json-serialize payload)))
 
-(defun logx--disk-appender (event)
-  "Append serialized EVENT to `logx-log-file' if configured."
-  (when (and logx-log-file (stringp logx-log-file))
+;;; ----------------------------------------------------------------------------
+;;; Pluggable Output Backends (File, Journald, Syslog, Custom)
+;;; ----------------------------------------------------------------------------
+
+(defvar logx--backends nil
+  "Alist of (ID . (:handler HANDLER :enabled ENABLED-P)) registered backends.")
+
+;;;###autoload
+(defun logx-register-backend (id handler &optional enabled)
+  "Register backend ID with batch HANDLER function.
+HANDLER is called with a list of event plists: (funcall HANDLER events)."
+  (setq logx--backends
+        (cons (cons id (list :handler handler :enabled (if (null enabled) t enabled)))
+              (assq-delete-all id logx--backends))))
+
+;;;###autoload
+(defun logx-unregister-backend (id)
+  "Unregister backend ID."
+  (setq logx--backends (assq-delete-all id logx--backends)))
+
+;;;###autoload
+(defun logx-enable-backend (id)
+  "Enable backend ID."
+  (let ((entry (assq id logx--backends)))
+    (when entry
+      (setf (plist-get (cdr entry) :enabled) t))))
+
+;;;###autoload
+(defun logx-disable-backend (id)
+  "Disable backend ID."
+  (let ((entry (assq id logx--backends)))
+    (when entry
+      (setf (plist-get (cdr entry) :enabled) nil))))
+
+;;;###autoload
+(defun logx-backend-enabled-p (id)
+  "Return non-nil if backend ID is registered and enabled."
+  (let ((entry (assq id logx--backends)))
+    (and entry (plist-get (cdr entry) :enabled))))
+
+;; File (JSON Lines) Backend
+(defun logx--file-backend-handler (events)
+  "Batch append EVENTS to `logx-log-file'."
+  (when (and logx-log-file (stringp logx-log-file) events)
     (condition-case err
-        (let ((json-line (concat (logx--serialize-jsonl event) "\n")))
-          (with-temp-buffer
-            (insert json-line)
-            (append-to-file (point-min) (point-max) logx-log-file)))
+        (with-temp-buffer
+          (dolist (ev events)
+            (insert (logx--serialize-jsonl ev) "\n"))
+          (append-to-file (point-min) (point-max) logx-log-file))
       (error
        (message "[logx] Disk appender failed: %s" (error-message-string err))))))
+
+;; systemd-journald Native Socket Backend
+(defvar logx--journald-process nil
+  "Persistent datagram process for systemd-journald.")
+
+(defun logx--journald-ensure-process ()
+  "Ensure persistent datagram socket connection to systemd-journald."
+  (unless (and logx--journald-process (process-live-p logx--journald-process))
+    (when (and (stringp logx-journald-socket) (file-exists-p logx-journald-socket))
+      (condition-case nil
+          (setq logx--journald-process
+                (make-network-process :name "logx-journald"
+                                      :family 'local
+                                      :service logx-journald-socket
+                                      :type 'datagram))
+        (error nil))))
+  logx--journald-process)
+
+(defun logx--journald-format-event (ev)
+  "Format EVENT plist into systemd-journald native socket datagram."
+  (let* ((lvl (plist-get ev :lvl))
+         (prio (pcase lvl
+                 ('fatal 2)
+                 ('alert 1)
+                 ('critical 2)
+                 ('error 3)
+                 ('warn 4)
+                 ('notice 5)
+                 ('info 6)
+                 ('debug 7)
+                 (_ 6)))
+         (cat (format "%s" (or (plist-get ev :cat) "root")))
+         (msg (format "%s" (or (plist-get ev :msg) "")))
+         (seq (plist-get ev :seq))
+         (src (plist-get ev :src))
+         (file (or (plist-get src :file) (plist-get src :path)))
+         (line (plist-get src :line))
+         (data (plist-get ev :data)))
+    (concat "MESSAGE=" msg "\n"
+            "PRIORITY=" (number-to-string prio) "\n"
+            "SYSLOG_IDENTIFIER=emacs\n"
+            "EMACS_CATEGORY=" cat "\n"
+            (when seq (concat "EMACS_SEQ=" (number-to-string seq) "\n"))
+            (when file (concat "CODE_FILE=" (format "%s" file) "\n"))
+            (when line (concat "CODE_LINE=" (number-to-string line) "\n"))
+            (when data
+              (concat "EMACS_DATA=" (json-serialize (logx--sanitize-value data)) "\n"))
+            "\n")))
+
+(defun logx--journald-backend-handler (events)
+  "Send EVENTS batch to systemd-journald over datagram socket."
+  (let ((proc (logx--journald-ensure-process)))
+    (when proc
+      (dolist (ev events)
+        (condition-case nil
+            (process-send-string proc (logx--journald-format-event ev))
+          (error nil))))))
+
+;; Legacy syslog Datagram Backend
+(defvar logx--syslog-process nil
+  "Persistent datagram process for syslog.")
+
+(defun logx--syslog-ensure-process ()
+  "Ensure persistent datagram socket connection to syslog."
+  (unless (and logx--syslog-process (process-live-p logx--syslog-process))
+    (when (and (stringp logx-syslog-socket) (file-exists-p logx-syslog-socket))
+      (condition-case nil
+          (setq logx--syslog-process
+                (make-network-process :name "logx-syslog"
+                                      :family 'local
+                                      :service logx-syslog-socket
+                                      :type 'datagram))
+        (error nil))))
+  logx--syslog-process)
+
+(defun logx--syslog-format-event (ev)
+  "Format EVENT plist into RFC 3164 syslog datagram."
+  (let* ((lvl (plist-get ev :lvl))
+         (prio (pcase lvl
+                 ('fatal 2)
+                 ('alert 1)
+                 ('critical 2)
+                 ('error 3)
+                 ('warn 4)
+                 ('notice 5)
+                 ('info 6)
+                 ('debug 7)
+                 (_ 6)))
+         (facility 8) ; user-level facility (1 * 8 = 8)
+         (pri-val (+ facility prio))
+         (cat (format "%s" (or (plist-get ev :cat) "root")))
+         (msg (format "%s" (or (plist-get ev :msg) "")))
+         (ts-str (format-time-string "%b %e %T" (seconds-to-time (or (plist-get ev :ts) (float-time))))))
+    (format "<%d>%s emacs[%d]: [%s] %s\n" pri-val ts-str (emacs-pid) cat msg)))
+
+(defun logx--syslog-backend-handler (events)
+  "Send EVENTS batch to syslog over datagram socket."
+  (let ((proc (logx--syslog-ensure-process)))
+    (when proc
+      (dolist (ev events)
+        (condition-case nil
+            (process-send-string proc (logx--syslog-format-event ev))
+          (error nil))))))
+
+;; Initialize default backends
+(logx-register-backend 'file #'logx--file-backend-handler t)
+(logx-register-backend 'journald #'logx--journald-backend-handler nil)
+(logx-register-backend 'syslog #'logx--syslog-backend-handler nil)
+
+;;; ----------------------------------------------------------------------------
+;;; Asynchronous Flushing Pipeline & Backpressure
+;;; ----------------------------------------------------------------------------
+
+(defvar logx--async-queue nil
+  "FIFO list of events waiting to be flushed to active backends.")
+
+(defvar logx--async-queue-tail nil
+  "Pointer to the last cons cell of `logx--async-queue' for O(1) enqueue.")
+
+(defvar logx--async-queue-len 0
+  "Number of pending events in `logx--async-queue'.")
+
+(defvar logx--dropped-count 0
+  "Total count of events dropped due to backpressure.")
+
+(defvar logx--async-timer nil
+  "Timer driving the async flush worker.")
+
+(defvar logx--async-thread nil
+  "Thread driving the async flush worker.")
+
+;;;###autoload
+(defun logx-flush ()
+  "Synchronously flush all pending events in the async queue to active backends."
+  (interactive)
+  (when logx--async-queue
+    (let ((events logx--async-queue))
+      (setq logx--async-queue nil
+            logx--async-queue-tail nil
+            logx--async-queue-len 0)
+      (dolist (b logx--backends)
+        (when (plist-get (cdr b) :enabled)
+          (condition-case err
+              (funcall (plist-get (cdr b) :handler) events)
+            (error
+             (message "[logx] Backend %s failed: %s" (car b) (error-message-string err)))))))))
+
+(defun logx--async-schedule-flush ()
+  "Ensure the flush worker is scheduled according to `logx-async-transport'."
+  (pcase logx-async-transport
+    ('sync
+     (logx-flush))
+    ('thread
+     (unless (and logx--async-thread (thread-live-p logx--async-thread))
+       (setq logx--async-thread
+             (make-thread
+              (lambda ()
+                (while (and logx-async-mode (eq logx-async-transport 'thread))
+                  (when logx--async-queue
+                    (logx-flush))
+                  (if (fboundp 'thread-yield)
+                      (thread-yield)
+                    (sleep-for logx-async-flush-interval))
+                  (sleep-for logx-async-flush-interval)))
+              "logx-flush-worker"))))
+    (_ ;; 'timer
+     (unless logx--async-timer
+       (setq logx--async-timer
+             (run-with-timer logx-async-flush-interval nil
+                             (lambda ()
+                               (setq logx--async-timer nil)
+                               (logx-flush))))))))
+
+(defun logx--async-enqueue (event)
+  "Enqueue EVENT for asynchronous backend flushing with backpressure control."
+  ;; Backpressure check
+  (when (>= logx--async-queue-len logx-async-max-queue)
+    (pcase logx-async-backpressure-policy
+      (:yield
+       (logx-flush)
+       (when (fboundp 'thread-yield) (thread-yield)))
+      (_ ;; :drop-oldest
+       (setq logx--async-queue (cdr logx--async-queue)
+             logx--async-queue-len (max 0 (1- logx--async-queue-len)))
+       (cl-incf logx--dropped-count))))
+  ;; Append to queue
+  (let ((cell (cons event nil)))
+    (if logx--async-queue-tail
+        (progn
+          (setcdr logx--async-queue-tail cell)
+          (setq logx--async-queue-tail cell))
+      (setq logx--async-queue cell
+            logx--async-queue-tail cell))
+    (cl-incf logx--async-queue-len))
+  ;; Schedule flush
+  (logx--async-schedule-flush))
+
+;; Flush on Emacs exit
+(add-hook 'kill-emacs-hook #'logx-flush)
 
 ;;; ----------------------------------------------------------------------------
 ;;; Event Emission Pipeline & Headless Subscriber Dispatch
@@ -303,9 +581,20 @@ If LIMIT is non-nil, return at most LIMIT entries."
                      :msg (or msg "")
                      :src src
                      :data data)))
+    ;; 1. Synchronous core in-memory ring buffer (Primary Ingress)
     (logx--ring-push event)
-    (when logx-log-file
-      (logx--disk-appender event))
+
+    ;; 2. Async queue to active output backends (file, journald, syslog)
+    (if (and logx-async-mode (not (eq logx-async-transport 'sync)))
+        (logx--async-enqueue event)
+      ;; Direct sync dispatch if async disabled
+      (dolist (b logx--backends)
+        (when (plist-get (cdr b) :enabled)
+          (condition-case nil
+              (funcall (plist-get (cdr b) :handler) (list event))
+            (error nil)))))
+
+    ;; 3. Live UI subscribers & hook
     (dolist (sub logx--active-subscribers)
       (condition-case nil
           (funcall (cdr sub) event)

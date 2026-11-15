@@ -170,6 +170,7 @@
         (progn
           (logx-info :cat 'fs :msg "Disk append event 1" :field "val1")
           (logx-info :cat 'fs :msg "Disk append event 2" :field "val2")
+          (logx-flush)
           (with-temp-buffer
             (insert-file-contents tmp-file)
             (let ((lines (split-string (buffer-string) "\n" t)))
@@ -178,6 +179,83 @@
               (should (string-match-p "Disk append event 2" (cadr lines))))))
       (when (file-exists-p tmp-file)
         (delete-file tmp-file)))))
+
+(ert-deftest test-logx-pluggable-backends ()
+  "Verify backend registration, enable/disable, and batch dispatch."
+  (let ((received nil)
+        (logx-default-level 'info)
+        (logx-async-mode nil))
+    (logx-register-backend 'mock-custom (lambda (evs) (setq received (append received evs))) t)
+    (should (logx-backend-enabled-p 'mock-custom))
+
+    (logx-info :cat 'test :msg "Custom backend event 1")
+    (should (= (length received) 1))
+    (should (equal (plist-get (car received) :msg) "Custom backend event 1"))
+
+    (logx-disable-backend 'mock-custom)
+    (should-not (logx-backend-enabled-p 'mock-custom))
+    (logx-info :cat 'test :msg "Custom backend event 2")
+    (should (= (length received) 1)) ; did not receive event 2
+
+    (logx-enable-backend 'mock-custom)
+    (should (logx-backend-enabled-p 'mock-custom))
+    (logx-info :cat 'test :msg "Custom backend event 3")
+    (should (= (length received) 2))
+
+    (logx-unregister-backend 'mock-custom)
+    (should-not (logx-backend-enabled-p 'mock-custom))))
+
+(ert-deftest test-logx-journald-format ()
+  "Verify formatting of systemd-journald socket datagrams."
+  (let* ((ev (list :seq 42
+                   :ts 1700000000.0
+                   :lvl 'error
+                   :cat 'service.auth
+                   :msg "Authentication failure"
+                   :src '(:file "auth.el" :line 88)
+                   :data '(:uid 1002 :ip "10.0.0.1")))
+         (datagram (logx--journald-format-event ev)))
+    (should (string-match-p "^MESSAGE=Authentication failure\n" datagram))
+    (should (string-match-p "^PRIORITY=3\n" datagram))
+    (should (string-match-p "^SYSLOG_IDENTIFIER=emacs\n" datagram))
+    (should (string-match-p "^EMACS_CATEGORY=service.auth\n" datagram))
+    (should (string-match-p "^EMACS_SEQ=42\n" datagram))
+    (should (string-match-p "^CODE_FILE=auth.el\n" datagram))
+    (should (string-match-p "^CODE_LINE=88\n" datagram))
+    (should (string-match-p "\"uid\":1002" datagram))))
+
+(ert-deftest test-logx-syslog-format ()
+  "Verify formatting of RFC 3164 syslog datagrams."
+  (let* ((ev (list :seq 1
+                   :ts 1700000000.0
+                   :lvl 'warn
+                   :cat 'disk
+                   :msg "Space low"
+                   :src nil
+                   :data nil))
+         (datagram (logx--syslog-format-event ev)))
+    ;; Priority for warn (4) with user facility (8) = 12
+    (should (string-prefix-p "<12>" datagram))
+    (should (string-match-p (format "emacs\\[%d\\]: \\[disk\\] Space low\n" (emacs-pid)) datagram))))
+
+(ert-deftest test-logx-async-backpressure ()
+  "Verify backpressure queue bounding and drop policy."
+  (let ((logx-async-mode t)
+        (logx-async-transport 'sync)
+        (logx-async-max-queue 5)
+        (logx-async-backpressure-policy :drop-oldest)
+        (logx--async-queue nil)
+        (logx--async-queue-tail nil)
+        (logx--async-queue-len 0)
+        (logx--dropped-count 0))
+    ;; Simulate enqueueing 10 events into a max 5 queue without flushing
+    (cl-letf (((symbol-function 'logx--async-schedule-flush) #'ignore))
+      (dotimes (i 10)
+        (logx--async-enqueue (list :seq i :msg (format "ev-%d" i)))))
+    (should (= logx--async-queue-len 5))
+    (should (= logx--dropped-count 5))
+    ;; Oldest remaining event should be ev-5
+    (should (equal (plist-get (car logx--async-queue) :msg) "ev-5"))))
 
 (provide 'test-logx)
 ;;; test-logx.el ends here
