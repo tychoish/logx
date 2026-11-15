@@ -257,5 +257,102 @@
     ;; Oldest remaining event should be ev-5
     (should (equal (plist-get (car logx--async-queue) :msg) "ev-5"))))
 
+(ert-deftest test-logx-category-string-symbol-interop ()
+  "Verify category levels match interchangeably across strings and symbols."
+  (let ((logx-default-level 'info)
+        (logx-category-levels nil))
+    ;; Set as symbol, check as string
+    (logx-set-category-level 'sym.cat 'debug)
+    (should (logx--level-enabled-p 'debug 'sym.cat))
+    (should (logx--level-enabled-p 'debug "sym.cat"))
+
+    ;; Set as string, check as symbol
+    (logx-set-category-level "str.cat" 'debug)
+    (should (logx--level-enabled-p 'debug 'str.cat))
+    (should (logx--level-enabled-p 'debug "str.cat"))))
+
+(ert-deftest test-logx-socket-error-recovery ()
+  "Verify backend process handles errors and cleans up socket reference."
+  (let ((logx--journald-process 'dummy-proc)
+        (logx--syslog-process 'dummy-proc))
+    (cl-letf (((symbol-function 'process-send-string)
+               (lambda (_proc _str) (error "Simulated socket error (ECONNRESET)")))
+              ((symbol-function 'delete-process) #'ignore))
+      ;; journald handler error cleans up process
+      (logx--journald-backend-handler (list (list :lvl 'info :msg "test")))
+      (should-not logx--journald-process)
+
+      ;; syslog handler error cleans up process
+      (logx--syslog-backend-handler (list (list :lvl 'info :msg "test")))
+      (should-not logx--syslog-process))))
+
+(ert-deftest test-logx-flush-return-count ()
+  "Verify logx-flush returns number of flushed events."
+  (let ((logx-async-mode t)
+        (logx-async-transport 'sync)
+        (logx--async-queue nil)
+        (logx--async-queue-tail nil)
+        (logx--async-queue-len 0))
+    ;; Mock schedule-flush to prevent immediate flush
+    (cl-letf (((symbol-function 'logx--async-schedule-flush) #'ignore))
+      (logx--async-enqueue (list :msg "ev1"))
+      (logx--async-enqueue (list :msg "ev2"))
+      (logx--async-enqueue (list :msg "ev3"))
+      (should (= logx--async-queue-len 3))
+      (let ((flushed (logx-flush)))
+        (should (= flushed 3))
+        (should (= logx--async-queue-len 0))
+        (should-not logx--async-queue)))))
+
+(ert-deftest test-logx-async-thread-transport ()
+  "Verify background thread transport flushes pending events."
+  (let ((flushed-events nil)
+        (orig-mode logx-async-mode)
+        (orig-transport logx-async-transport)
+        (orig-interval logx-async-flush-interval))
+    (unwind-protect
+        (progn
+          (setq logx-async-mode t
+                logx-async-transport 'thread
+                logx-async-flush-interval 0.02
+                logx--async-queue nil
+                logx--async-queue-tail nil
+                logx--async-queue-len 0)
+          (logx-register-backend 'test-thread-backend
+                                 (lambda (evs) (setq flushed-events (append flushed-events evs)))
+                                 t)
+          (logx--async-enqueue (list :msg "Thread event 1"))
+          (logx--async-enqueue (list :msg "Thread event 2"))
+          ;; Allow background thread to wake up and flush
+          (sleep-for 0.08)
+          (should (>= (length flushed-events) 2))
+          (should (equal (plist-get (car flushed-events) :msg) "Thread event 1")))
+      (logx-stop-async-worker)
+      (logx-unregister-backend 'test-thread-backend)
+      (setq logx-async-mode orig-mode
+            logx-async-transport orig-transport
+            logx-async-flush-interval orig-interval))))
+
+(ert-deftest test-logx-quarantine-mode ()
+  "Verify logx-quarantine-mode intercepts whitelisted package messages."
+  (let ((logx-quarantined-packages '("mock-pkg"))
+        (logx--in-quarantine-p nil)
+        (intercepted nil)
+        (this-command nil)
+        (inhibit-message nil))
+    (unwind-protect
+        (progn
+          (logx-quarantine-mode 1)
+          (cl-letf (((symbol-function 'logx--caller-matches-quarantine-p)
+                     (lambda (_pkgs) "mock-pkg"))
+                    ((symbol-function 'logx--emit-event)
+                     (lambda (lvl cat msg src data)
+                       (push (list :lvl lvl :cat cat :msg msg :src src :data data) intercepted))))
+            (message "Hello from mock background package %d" 42)
+            (should (= (length intercepted) 1))
+            (should (equal (plist-get (car intercepted) :cat) 'legacy.mock-pkg))
+            (should (equal (plist-get (car intercepted) :msg) "Hello from mock background package 42"))))
+      (logx-quarantine-mode -1))))
+
 (provide 'test-logx)
 ;;; test-logx.el ends here

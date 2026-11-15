@@ -115,7 +115,7 @@ Returns nil if LINE-STR is blank or unparseable."
           (unless first (insert "  "))
           (setq first nil)
           (insert (propertize (format "%s:" k-name) 'face 'jsonl-view-key) " ")
-          (if (or (consp v) (hash-table-p v) (> (length v-str) jsonl-view-truncate-length))
+          (if (or (consp v) (hash-table-p v))
               (insert-text-button "▶"
                                   'action #'jsonl-view--toggle-disclosure-action
                                   'jsonl-value v
@@ -123,7 +123,19 @@ Returns nil if LINE-STR is blank or unparseable."
                                   'face 'jsonl-view-disclosure-button
                                   'help-echo "mouse-1, RET: expand payload"
                                   'follow-link t)
-            (insert (propertize v-str 'face (if (numberp v) 'jsonl-view-number 'jsonl-view-string)))))
+            (if (> (length v-str) jsonl-view-truncate-length)
+                (progn
+                  (insert (propertize (substring v-str 0 jsonl-view-truncate-length)
+                                      'face 'jsonl-view-string))
+                  (insert " ")
+                  (insert-text-button "…"
+                                      'action #'jsonl-view--toggle-disclosure-action
+                                      'jsonl-value v
+                                      'jsonl-expanded nil
+                                      'face 'jsonl-view-disclosure-button
+                                      'help-echo "mouse-1, RET: expand full text"
+                                      'follow-link t))
+              (insert (propertize v-str 'face (if (numberp v) 'jsonl-view-number 'jsonl-view-string))))))
         (setq tail (cddr tail)))
       (insert "\n")
       (propertize (buffer-string)
@@ -140,41 +152,39 @@ Returns nil if LINE-STR is blank or unparseable."
          (inhibit-read-only t))
     (save-excursion
       (goto-char (button-start btn))
-      (let ((line-end (line-end-position)))
-        (if expanded
-            (progn
-              (button-put btn 'jsonl-expanded nil)
-              (let ((beg (button-start btn))
-                    (end (button-end btn)))
-                (delete-region beg end)
-                (insert-text-button "▶"
-                                    'action #'jsonl-view--toggle-disclosure-action
-                                    'jsonl-value full-val
-                                    'jsonl-expanded nil
-                                    'face 'jsonl-view-disclosure-button
-                                    'follow-link t))
-              (forward-line 1)
-              (while (and (not (eobp)) (get-text-property (point) 'jsonl-expansion))
-                (let ((kill-end (min (point-max) (1+ (line-end-position)))))
-                  (delete-region (point) kill-end))))
-          (button-put btn 'jsonl-expanded t)
-          (let ((beg (button-start btn))
-                (end (button-end btn)))
-            (delete-region beg end)
-            (insert-text-button "▼"
-                                'action #'jsonl-view--toggle-disclosure-action
-                                'jsonl-value full-val
-                                'jsonl-expanded t
-                                'face 'jsonl-view-disclosure-button
-                                'follow-link t))
-          (goto-char line-end)
-          (insert "\n")
-          (let ((formatted-json (condition-case nil
-                                    (json-serialize full-val)
-                                  (error (format "%S" full-val)))))
-            (insert (propertize (format "    %s\n" formatted-json)
-                                'jsonl-expansion t
-                                'face 'font-lock-doc-face))))))))
+      (if expanded
+          (progn
+            (let ((beg (button-start btn))
+                  (end (button-end btn)))
+              (delete-region beg end)
+              (insert-text-button (if (stringp full-val) "…" "▶")
+                                  'action #'jsonl-view--toggle-disclosure-action
+                                  'jsonl-value full-val
+                                  'jsonl-expanded nil
+                                  'face 'jsonl-view-disclosure-button
+                                  'help-echo "mouse-1, RET: expand payload"
+                                  'follow-link t))
+            (goto-char (line-end-position))
+            (when (get-text-property (point) 'jsonl-expansion)
+              (let ((exp-end (or (next-single-property-change (point) 'jsonl-expansion) (point-max))))
+                (delete-region (point) exp-end))))
+        (let ((beg (button-start btn))
+              (end (button-end btn)))
+          (delete-region beg end)
+          (insert-text-button "▼"
+                              'action #'jsonl-view--toggle-disclosure-action
+                              'jsonl-value full-val
+                              'jsonl-expanded t
+                              'face 'jsonl-view-disclosure-button
+                              'help-echo "mouse-1, RET: collapse payload"
+                              'follow-link t))
+        (goto-char (line-end-position))
+        (let ((formatted-json (condition-case nil
+                                  (json-serialize full-val)
+                                (error (format "%S" full-val)))))
+          (insert (propertize (format "\n    %s" formatted-json)
+                              'jsonl-expansion t
+                              'face 'font-lock-doc-face)))))))
 
 ;;;###autoload
 (defun jsonl-view-toggle-disclosure ()
@@ -201,15 +211,13 @@ Returns nil if LINE-STR is blank or unparseable."
   "Collapse all expanded disclosure blocks across the buffer."
   (interactive)
   (let ((inhibit-read-only t)
-        (pos (point-min)))
+        (btn (next-button (point-min))))
     (save-excursion
-      (while (< pos (point-max))
-        (goto-char pos)
-        (let ((btn (button-at pos)))
-          (when (and btn (button-get btn 'jsonl-expanded))
-            (jsonl-view--toggle-disclosure-action btn)))
-        (forward-line 1)
-        (setq pos (point)))))
+      (while btn
+        (let ((next (next-button (button-end btn))))
+          (when (button-get btn 'jsonl-expanded)
+            (jsonl-view--toggle-disclosure-action btn))
+          (setq btn next)))))
   (message "Collapsed all disclosures."))
 
 ;;; ----------------------------------------------------------------------------
@@ -240,21 +248,30 @@ Returns nil if LINE-STR is blank or unparseable."
 
 (defun jsonl-view--apply-filters ()
   "Apply `jsonl-view-filter-predicate' via buffer-invisibility-spec."
-  (let ((inhibit-read-only t))
+  (let ((inhibit-read-only t)
+        (parent-hidden nil))
     (save-excursion
       (goto-char (point-min))
       (while (not (eobp))
         (let* ((pos (point))
                (rec (get-text-property pos 'jsonl-record))
-               (eol (line-end-position)))
-          (when rec
+               (is-expansion (get-text-property pos 'jsonl-expansion))
+               (eol (line-end-position))
+               (line-end (min (1+ eol) (point-max))))
+          (cond
+           (is-expansion
+            (if parent-hidden
+                (put-text-property pos line-end 'invisible 'jsonl-filter-hidden)
+              (remove-text-properties pos line-end '(invisible nil))))
+           (rec
             (let ((hide (and jsonl-view-filter-predicate
                              (not (funcall jsonl-view-filter-predicate rec)))))
+              (setq parent-hidden hide)
               (if hide
-                  (put-text-property pos (min (1+ eol) (point-max))
-                                     'invisible 'jsonl-filter-hidden)
-                (remove-text-properties pos (min (1+ eol) (point-max))
-                                        '(invisible nil))))))
+                  (put-text-property pos line-end 'invisible 'jsonl-filter-hidden)
+                (remove-text-properties pos line-end '(invisible nil)))))
+           (t
+            (setq parent-hidden nil))))
         (forward-line 1)))))
 
 ;;; ----------------------------------------------------------------------------
@@ -344,6 +361,12 @@ Returns nil if LINE-STR is blank or unparseable."
     map)
   "Keymap for `jsonl-view-mode'.")
 
+(defun jsonl-view--on-kill-buffer ()
+  "Clean up auxiliary info inspector window when viewer buffer is killed."
+  (let ((win (get-buffer-window jsonl-view-info-buffer-name)))
+    (when (window-live-p win)
+      (delete-window win))))
+
 ;;;###autoload
 (define-derived-mode jsonl-view-mode special-mode "JSONL-View"
   "Major mode for viewing line-delimited JSON data streams."
@@ -351,7 +374,8 @@ Returns nil if LINE-STR is blank or unparseable."
   (setq-local truncate-lines t)
   (setq-local buffer-read-only t)
   (add-to-invisibility-spec '(jsonl-filter-hidden . t))
-  (add-hook 'post-command-hook #'jsonl-view--info-post-command nil t))
+  (add-hook 'post-command-hook #'jsonl-view--info-post-command nil t)
+  (add-hook 'kill-buffer-hook #'jsonl-view--on-kill-buffer nil t))
 
 ;;;###autoload
 (defun jsonl-view-file (file)

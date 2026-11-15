@@ -293,7 +293,7 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
                  (k-name (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k)))
                  (v-str (format "%s" v)))
             (insert "  " (propertize (format "%s:" k-name) 'face 'logx-view-key) " ")
-            (if (or (consp v) (hash-table-p v) (> (length v-str) jsonl-view-truncate-length))
+            (if (or (consp v) (hash-table-p v))
                 (insert-text-button "▶"
                                     'action #'jsonl-view--toggle-disclosure-action
                                     'jsonl-value v
@@ -301,7 +301,19 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
                                     'face 'jsonl-view-disclosure-button
                                     'help-echo "mouse-1, RET: expand payload"
                                     'follow-link t)
-              (insert (propertize v-str 'face (if (numberp v) 'jsonl-view-number 'jsonl-view-string)))))
+              (if (> (length v-str) jsonl-view-truncate-length)
+                  (progn
+                    (insert (propertize (substring v-str 0 jsonl-view-truncate-length)
+                                        'face 'font-lock-string-face))
+                    (insert " ")
+                    (insert-text-button "…"
+                                        'action #'jsonl-view--toggle-disclosure-action
+                                        'jsonl-value v
+                                        'jsonl-expanded nil
+                                        'face 'jsonl-view-disclosure-button
+                                        'help-echo "mouse-1, RET: expand full text"
+                                        'follow-link t))
+                (insert (propertize v-str 'face (if (numberp v) 'font-lock-constant-face 'font-lock-string-face))))))
           (setq tail (cddr tail))))
       ;; Source hyperlink
       (when src
@@ -385,15 +397,24 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
 
 (defun logx-view--apply-filters ()
   "Apply active level and category filters via buffer-invisibility-spec."
-  (let ((inhibit-read-only t))
+  (let ((inhibit-read-only t)
+        (parent-hidden nil))
     (save-excursion
       (goto-char (point-min))
       (while (not (eobp))
         (let* ((pos (point))
+               (rec (get-text-property pos 'jsonl-record))
                (lvl (get-text-property pos 'logx-lvl))
                (cat (get-text-property pos 'logx-cat))
-               (eol (line-end-position)))
-          (when (or (get-text-property pos 'jsonl-record) lvl)
+               (is-expansion (get-text-property pos 'jsonl-expansion))
+               (eol (line-end-position))
+               (line-end (min (1+ eol) (point-max))))
+          (cond
+           (is-expansion
+            (if parent-hidden
+                (put-text-property pos line-end 'invisible 'jsonl-filter-hidden)
+              (remove-text-properties pos line-end '(invisible nil))))
+           ((or rec lvl)
             (let ((hide nil))
               (when (and logx-view-min-level
                          (< (logx-level-weight lvl) (logx-level-weight logx-view-min-level)))
@@ -401,11 +422,16 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
               (when (and logx-view-category-filter
                          (not (string-match-p logx-view-category-filter (format "%s" (or cat "")))))
                 (setq hide t))
+              (when (and jsonl-view-filter-predicate
+                         rec
+                         (not (funcall jsonl-view-filter-predicate rec)))
+                (setq hide t))
+              (setq parent-hidden hide)
               (if hide
-                  (put-text-property pos (min (1+ eol) (point-max))
-                                     'invisible 'jsonl-filter-hidden)
-                (remove-text-properties pos (min (1+ eol) (point-max))
-                                        '(invisible nil))))))
+                  (put-text-property pos line-end 'invisible 'jsonl-filter-hidden)
+                (remove-text-properties pos line-end '(invisible nil)))))
+           (t
+            (setq parent-hidden nil))))
         (forward-line 1)))))
 
 ;;; ----------------------------------------------------------------------------
@@ -437,7 +463,15 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
   "Unregister BUFFER from live log event delivery."
   (setq logx-view--active-viewers (assq-delete-all buffer logx-view--active-viewers))
   (unless logx-view--active-viewers
-    (logx-unregister-subscriber 'logx-view)))
+    (logx-unregister-subscriber 'logx-view)
+    (when logx-view--flush-timer
+      (cancel-timer logx-view--flush-timer)
+      (setq logx-view--flush-timer nil))
+    (setq logx-view--pending-events nil)))
+
+(defun logx-view--on-kill-buffer ()
+  "Cleanup hook when a `logx-view-mode' buffer is killed."
+  (logx-view-unregister-viewer (current-buffer)))
 
 (defun logx-view--flush-active-viewers ()
   "Flush pending events to all visible subscriber viewer buffers in batches."
@@ -500,18 +534,22 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
   "Create and display a specialized live viewer buffer.
 Creates *logs:NAME* containing events matching FILTER-PRED."
   (interactive
-   (let* ((n (read-string "Filtered buffer name suffix (e.g. error, asq): "))
-          (min-lvl (intern (completing-read "Minimum severity: "
+   (let* ((min-lvl (intern (completing-read "Minimum severity: "
                                             '("debug" "info" "notice" "warn" "error" "critical" "alert" "fatal")
                                             nil t nil nil "info")))
-          (cat-rx (read-string "Category regex (empty for all): ")))
+          (cat-rx (read-string "Category regex (empty for all): "))
+          (default-name (if (string-empty-p cat-rx)
+                            (symbol-name min-lvl)
+                          (format "%s.%s" cat-rx min-lvl)))
+          (n (read-string (format "Filtered buffer name suffix (default %s): " default-name)
+                          nil nil default-name)))
      (list n
            (lambda (ev)
              (let ((l (plist-get ev :lvl))
                    (c (format "%s" (or (plist-get ev :cat) ""))))
                (and (>= (logx-level-weight l) (logx-level-weight min-lvl))
                     (if (string-empty-p cat-rx) t (string-match-p cat-rx c))))))))
-  (let* ((buf-name (format "*logs:%s*" name))
+  (let* ((buf-name (format "*logs:%s*" (if (string-empty-p name) "custom" name)))
          (buf (get-buffer-create buf-name)))
     (with-current-buffer buf
       (logx-view-mode)
@@ -546,7 +584,7 @@ Creates *logs:NAME* containing events matching FILTER-PRED."
   "Major mode for viewing live and persisted logx event streams."
   :group 'logx-view
   (setq-local jsonl-view-formatter-function #'logx-view-render-record)
-  (add-hook 'kill-buffer-hook (lambda () (logx-view-unregister-viewer (current-buffer))) nil t))
+  (add-hook 'kill-buffer-hook #'logx-view--on-kill-buffer nil t))
 
 (provide 'logx-view)
 ;;; logx-view.el ends here

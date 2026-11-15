@@ -51,7 +51,15 @@
       (should (equal captured "[AlertTitle] AlertMessage"))
 
       (logx-alert-sink '(:message "AlertMessageOnly"))
-      (should (equal captured "AlertMessageOnly")))))
+      (should (equal captured "AlertMessageOnly"))
+
+      ;; Title only (no message)
+      (logx-alert-sink '(:title "AlertTitleOnly"))
+      (should (equal captured "[AlertTitleOnly]"))
+
+      ;; Neither title nor message
+      (logx-alert-sink '(:severity high))
+      (should (equal captured "Alert notification")))))
 
 (ert-deftest test-logx-alert-register ()
   "Verify registration with alert-define-style when alert is available."

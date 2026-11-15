@@ -68,5 +68,54 @@
     (jsonl-view-copy-as-json)
     (should (string-match-p "bob" (current-kill 0)))))
 
+(ert-deftest test-jsonl-view-truncation-preview ()
+  "Verify long strings render truncated prefix and ellipsis button."
+  (let* ((long-val (make-string 100 ?x))
+         (rec (list :msg long-val))
+         (rendered (jsonl-view-default-formatter rec)))
+    (should (string-match-p (make-string jsonl-view-truncate-length ?x) rendered))
+    (should (string-match-p "…" rendered))))
+
+(ert-deftest test-jsonl-view-collapse-all-midline ()
+  "Verify collapse-all collapses buttons located mid-line."
+  (with-temp-buffer
+    (jsonl-view-mode)
+    (let ((inhibit-read-only t))
+      ;; Insert records with nested complex objects (buttons are mid-line after 'data:')
+      (insert (jsonl-view-default-formatter '(:id 1 :data (:sub "val1"))))
+      (insert (jsonl-view-default-formatter '(:id 2 :data (:sub "val2")))))
+    (goto-char (point-min))
+    ;; Expand line 1
+    (jsonl-view-toggle-disclosure)
+    ;; Line 1 should have inserted an expansion line
+    (should (> (count-lines (point-min) (point-max)) 2))
+    ;; Collapse all
+    (jsonl-view-collapse-all)
+    ;; Lines should return to 2
+    (should (= (count-lines (point-min) (point-max)) 2))))
+
+(ert-deftest test-jsonl-view-filter-hides-expansions ()
+  "Verify filtering hides multi-line expansions alongside parent records."
+  (with-temp-buffer
+    (jsonl-view-mode)
+    (let ((inhibit-read-only t))
+      (insert (jsonl-view-default-formatter '(:id 1 :role "guest" :details (:note "secret"))))
+      (insert (jsonl-view-default-formatter '(:id 2 :role "admin" :details (:note "public")))))
+    (goto-char (point-min))
+    ;; Expand guest record
+    (jsonl-view-toggle-disclosure)
+    ;; Filter to show only admin
+    (jsonl-view-filter (lambda (rec) (equal (plist-get rec :role) "admin")))
+    ;; Guest line and its expansion line must be hidden
+    (save-excursion
+      (goto-char (point-min))
+      (should (eq (get-text-property (point) 'invisible) 'jsonl-filter-hidden))
+      (forward-line 1)
+      ;; Expansion line must also be hidden
+      (should (eq (get-text-property (point) 'invisible) 'jsonl-filter-hidden))
+      (forward-line 1)
+      ;; Admin line must be visible
+      (should-not (get-text-property (point) 'invisible)))))
+
 (provide 'test-jsonl-view)
 ;;; test-jsonl-view.el ends here

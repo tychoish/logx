@@ -34,7 +34,11 @@
          (cat (or (plist-get info :category) 'alert))
          (title (plist-get info :title))
          (msg (plist-get info :message))
-         (combined-msg (if title (format "[%s] %s" title msg) msg)))
+         (combined-msg (cond
+                        ((and title msg) (format "[%s] %s" title msg))
+                        (title (format "[%s]" title))
+                        (msg (format "%s" msg))
+                        (t "Alert notification"))))
     (logx--emit-event level (intern (format "%s" cat)) combined-msg nil info)))
 
 ;;;###autoload

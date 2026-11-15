@@ -136,14 +136,20 @@
 
 ;;;###autoload
 (defun logx-set-category-level (category level)
-  "Set threshold for CATEGORY to LEVEL."
-  (setf (map-elt logx-category-levels category) level))
+  "Set threshold for CATEGORY (symbol or string) to LEVEL."
+  (let ((cat-sym (if (symbolp category) category (intern (format "%s" category)))))
+    (setf (map-elt logx-category-levels cat-sym) level)))
 
 ;;;###autoload
 (defun logx--level-enabled-p (level &optional category)
   "Return non-nil if LEVEL meets or exceeds active threshold for CATEGORY."
   (let* ((weight (logx-level-weight level))
-         (cat-thresh (when category (map-elt logx-category-levels category)))
+         (cat-thresh (when category
+                       (let ((cat-sym (if (symbolp category)
+                                          category
+                                        (intern-soft (format "%s" category)))))
+                         (or (and cat-sym (map-elt logx-category-levels cat-sym))
+                             (map-elt logx-category-levels category)))))
          (threshold (or cat-thresh logx-default-level)))
     (>= weight (logx-level-weight threshold))))
 
@@ -354,6 +360,19 @@ HANDLER is called with a list of event plists: (funcall HANDLER events)."
       (error
        (message "[logx] Disk appender failed: %s" (error-message-string err))))))
 
+(defun logx--level-to-syslog-priority (level)
+  "Convert severity LEVEL symbol to numeric RFC 5424/3164 syslog priority (0-7)."
+  (pcase level
+    ('fatal    2)
+    ('alert    1)
+    ('critical 2)
+    ('error    3)
+    ('warn     4)
+    ('notice   5)
+    ('info     6)
+    ('debug    7)
+    (_         6)))
+
 ;; systemd-journald Native Socket Backend
 (defvar logx--journald-process nil
   "Persistent datagram process for systemd-journald.")
@@ -374,16 +393,7 @@ HANDLER is called with a list of event plists: (funcall HANDLER events)."
 (defun logx--journald-format-event (ev)
   "Format EVENT plist into systemd-journald native socket datagram."
   (let* ((lvl (plist-get ev :lvl))
-         (prio (pcase lvl
-                 ('fatal 2)
-                 ('alert 1)
-                 ('critical 2)
-                 ('error 3)
-                 ('warn 4)
-                 ('notice 5)
-                 ('info 6)
-                 ('debug 7)
-                 (_ 6)))
+         (prio (logx--level-to-syslog-priority lvl))
          (cat (format "%s" (or (plist-get ev :cat) "root")))
          (msg (format "%s" (or (plist-get ev :msg) "")))
          (seq (plist-get ev :seq))
@@ -409,7 +419,9 @@ HANDLER is called with a list of event plists: (funcall HANDLER events)."
       (dolist (ev events)
         (condition-case nil
             (process-send-string proc (logx--journald-format-event ev))
-          (error nil))))))
+          (error
+           (ignore-errors (delete-process proc))
+           (setq logx--journald-process nil)))))))
 
 ;; Legacy syslog Datagram Backend
 (defvar logx--syslog-process nil
@@ -431,16 +443,7 @@ HANDLER is called with a list of event plists: (funcall HANDLER events)."
 (defun logx--syslog-format-event (ev)
   "Format EVENT plist into RFC 3164 syslog datagram."
   (let* ((lvl (plist-get ev :lvl))
-         (prio (pcase lvl
-                 ('fatal 2)
-                 ('alert 1)
-                 ('critical 2)
-                 ('error 3)
-                 ('warn 4)
-                 ('notice 5)
-                 ('info 6)
-                 ('debug 7)
-                 (_ 6)))
+         (prio (logx--level-to-syslog-priority lvl))
          (facility 8) ; user-level facility (1 * 8 = 8)
          (pri-val (+ facility prio))
          (cat (format "%s" (or (plist-get ev :cat) "root")))
@@ -455,7 +458,9 @@ HANDLER is called with a list of event plists: (funcall HANDLER events)."
       (dolist (ev events)
         (condition-case nil
             (process-send-string proc (logx--syslog-format-event ev))
-          (error nil))))))
+          (error
+           (ignore-errors (delete-process proc))
+           (setq logx--syslog-process nil)))))))
 
 ;; Initialize default backends
 (logx-register-backend 'file #'logx--file-backend-handler t)
@@ -465,6 +470,9 @@ HANDLER is called with a list of event plists: (funcall HANDLER events)."
 ;;; ----------------------------------------------------------------------------
 ;;; Asynchronous Flushing Pipeline & Backpressure
 ;;; ----------------------------------------------------------------------------
+
+(defvar logx--async-mutex (make-mutex "logx-async")
+  "Mutex serializing access to `logx--async-queue'.")
 
 (defvar logx--async-queue nil
   "FIFO list of events waiting to be flushed to active backends.")
@@ -485,20 +493,37 @@ HANDLER is called with a list of event plists: (funcall HANDLER events)."
   "Thread driving the async flush worker.")
 
 ;;;###autoload
+(defun logx-stop-async-worker ()
+  "Stop running asynchronous worker timer and thread."
+  (when logx--async-timer
+    (cancel-timer logx--async-timer)
+    (setq logx--async-timer nil))
+  (when (and logx--async-thread (thread-live-p logx--async-thread))
+    (ignore-errors (thread-signal logx--async-thread 'quit nil))
+    (setq logx--async-thread nil)))
+
+;;;###autoload
 (defun logx-flush ()
-  "Synchronously flush all pending events in the async queue to active backends."
+  "Synchronously flush all pending events in the async queue to active backends.
+Returns the number of flushed events."
   (interactive)
-  (when logx--async-queue
-    (let ((events logx--async-queue))
-      (setq logx--async-queue nil
-            logx--async-queue-tail nil
-            logx--async-queue-len 0)
+  (let ((flushed-count 0)
+        (events nil))
+    (with-mutex logx--async-mutex
+      (when logx--async-queue
+        (setq events logx--async-queue
+              flushed-count logx--async-queue-len
+              logx--async-queue nil
+              logx--async-queue-tail nil
+              logx--async-queue-len 0)))
+    (when events
       (dolist (b logx--backends)
         (when (plist-get (cdr b) :enabled)
           (condition-case err
               (funcall (plist-get (cdr b) :handler) events)
             (error
-             (message "[logx] Backend %s failed: %s" (car b) (error-message-string err)))))))))
+             (message "[logx] Backend %s failed: %s" (car b) (error-message-string err)))))))
+    flushed-count))
 
 (defun logx--async-schedule-flush ()
   "Ensure the flush worker is scheduled according to `logx-async-transport'."
@@ -511,11 +536,8 @@ HANDLER is called with a list of event plists: (funcall HANDLER events)."
              (make-thread
               (lambda ()
                 (while (and logx-async-mode (eq logx-async-transport 'thread))
-                  (when logx--async-queue
+                  (when (> logx--async-queue-len 0)
                     (logx-flush))
-                  (if (fboundp 'thread-yield)
-                      (thread-yield)
-                    (sleep-for logx-async-flush-interval))
                   (sleep-for logx-async-flush-interval)))
               "logx-flush-worker"))))
     (_ ;; 'timer
@@ -528,25 +550,26 @@ HANDLER is called with a list of event plists: (funcall HANDLER events)."
 
 (defun logx--async-enqueue (event)
   "Enqueue EVENT for asynchronous backend flushing with backpressure control."
-  ;; Backpressure check
-  (when (>= logx--async-queue-len logx-async-max-queue)
-    (pcase logx-async-backpressure-policy
-      (:yield
-       (logx-flush)
-       (when (fboundp 'thread-yield) (thread-yield)))
-      (_ ;; :drop-oldest
-       (setq logx--async-queue (cdr logx--async-queue)
-             logx--async-queue-len (max 0 (1- logx--async-queue-len)))
-       (cl-incf logx--dropped-count))))
-  ;; Append to queue
-  (let ((cell (cons event nil)))
-    (if logx--async-queue-tail
-        (progn
-          (setcdr logx--async-queue-tail cell)
-          (setq logx--async-queue-tail cell))
-      (setq logx--async-queue cell
-            logx--async-queue-tail cell))
-    (cl-incf logx--async-queue-len))
+  (with-mutex logx--async-mutex
+    ;; Backpressure check
+    (when (>= logx--async-queue-len logx-async-max-queue)
+      (pcase logx-async-backpressure-policy
+        (:yield
+         (logx-flush)
+         (when (fboundp 'thread-yield) (thread-yield)))
+        (_ ;; :drop-oldest
+         (setq logx--async-queue (cdr logx--async-queue)
+               logx--async-queue-len (max 0 (1- logx--async-queue-len)))
+         (cl-incf logx--dropped-count))))
+    ;; Append to queue
+    (let ((cell (cons event nil)))
+      (if logx--async-queue-tail
+          (progn
+            (setcdr logx--async-queue-tail cell)
+            (setq logx--async-queue-tail cell))
+        (setq logx--async-queue cell
+              logx--async-queue-tail cell))
+      (cl-incf logx--async-queue-len)))
   ;; Schedule flush
   (logx--async-schedule-flush))
 

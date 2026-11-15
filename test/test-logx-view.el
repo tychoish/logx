@@ -142,5 +142,70 @@
       (logx-view-unregister-viewer buf)
       (kill-buffer buf))))
 
+(ert-deftest test-logx-view-combined-filters ()
+  "Verify level, category, and predicate filters compose cleanly."
+  (with-temp-buffer
+    (logx-view-mode)
+    (let ((inhibit-read-only t))
+      (insert (logx-view-render-record '(:ts 100.0 :lvl info :cat sys :msg "sys info" :tag "prod")))
+      (insert (logx-view-render-record '(:ts 101.0 :lvl error :cat sys :msg "sys err" :tag "staging")))
+      (insert (logx-view-render-record '(:ts 102.0 :lvl error :cat sys :msg "sys err prod" :tag "prod")))
+      (insert (logx-view-render-record '(:ts 103.0 :lvl error :cat app :msg "app err prod" :tag "prod"))))
+
+    ;; Apply level error + category sys + custom predicate (tag == prod)
+    (setq logx-view-min-level 'error
+          logx-view-category-filter "sys"
+          jsonl-view-filter-predicate (lambda (rec) (equal (plist-get rec :tag) "prod")))
+    (logx-view--apply-filters)
+
+    ;; Line 1: info (hidden by level)
+    (goto-char (point-min))
+    (should (invisible-p (point)))
+
+    ;; Line 2: staging (hidden by tag predicate)
+    (forward-line 1)
+    (should (invisible-p (point)))
+
+    ;; Line 3: error + sys + prod (VISIBLE)
+    (forward-line 1)
+    (should-not (invisible-p (point)))
+
+    ;; Line 4: app (hidden by category filter)
+    (forward-line 1)
+    (should (invisible-p (point)))))
+
+(ert-deftest test-logx-view-cleanup-on-kill ()
+  "Verify killing last viewer cancels timer and clears pending events."
+  (let ((buf (get-buffer-create "*test-logx-view-kill*")))
+    (with-current-buffer buf
+      (logx-view-mode))
+    (logx-view-register-viewer buf)
+    (logx--emit-event 'info 'test "Pending ev" nil nil)
+    (should logx-view--pending-events)
+    ;; Kill the buffer
+    (kill-buffer buf)
+    ;; active viewers should be empty, timer nil, pending events nil
+    (should-not logx-view--active-viewers)
+    (should-not logx-view--flush-timer)
+    (should-not logx-view--pending-events)))
+
+(ert-deftest test-logx-view-fork-buffer ()
+  "Verify logx-fork-filtered-buffer creates a filtered live buffer."
+  (let ((logx--ring (make-ring 10)))
+    (logx--ring-push '(:seq 1 :lvl info :cat "net" :msg "Net info"))
+    (logx--ring-push '(:seq 2 :lvl error :cat "net" :msg "Net error"))
+    (logx--ring-push '(:seq 3 :lvl error :cat "fs" :msg "FS error"))
+    (let ((forked-buf (logx-fork-filtered-buffer "test-net-err"
+                                                 (lambda (ev)
+                                                   (and (eq (plist-get ev :lvl) 'error)
+                                                        (equal (plist-get ev :cat) "net"))))))
+      (unwind-protect
+          (with-current-buffer forked-buf
+            (let ((content (buffer-string)))
+              (should-not (string-match-p "Net info" content))
+              (should (string-match-p "Net error" content))
+              (should-not (string-match-p "FS error" content))))
+        (kill-buffer forked-buf)))))
+
 (provide 'test-logx-view)
 ;;; test-logx-view.el ends here
