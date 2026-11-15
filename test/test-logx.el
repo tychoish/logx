@@ -152,5 +152,80 @@
       (when (file-exists-p tmp-file)
         (delete-file tmp-file)))))
 
+(ert-deftest test-logx-live-viewer-flush ()
+  "Verify live viewer receives batched events."
+  (let* ((buf (generate-new-buffer "*logx-test-viewer*"))
+         (logx-default-level 'info))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (jsonl-view-mode))
+          ;; Display buffer in a window so visibility check passes
+          (set-window-buffer (selected-window) buf)
+          (logx-register-viewer buf)
+
+          ;; Emit events
+          (logx-info :cat 'live :msg "Live event 1")
+          (logx-info :cat 'live :msg "Live event 2")
+
+          ;; Run synchronous flush
+          (logx--flush-active-viewers)
+
+          (with-current-buffer buf
+            (let ((content (buffer-string)))
+              (should (string-match-p "Live event 1" content))
+              (should (string-match-p "Live event 2" content)))))
+      (logx-unregister-viewer buf)
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
+(ert-deftest test-logx-multi-buffer-filtered-views ()
+  "Verify specialized filtered buffers receive only matching events."
+  (let* ((all-buf (generate-new-buffer "*logx-all*"))
+         (err-buf (generate-new-buffer "*logx-errors*"))
+         (logx-default-level 'debug))
+    (unwind-protect
+        (progn
+          (with-current-buffer all-buf (jsonl-view-mode))
+          (with-current-buffer err-buf (jsonl-view-mode))
+          (set-window-buffer (selected-window) all-buf)
+
+          ;; Register all-buf for all events, err-buf for only error/fatal
+          (logx-register-viewer all-buf (lambda (_ev) t))
+          (logx-register-viewer err-buf (lambda (ev) (eq (plist-get ev :lvl) 'error)))
+
+          ;; Pretend err-buf is also visible by mocking get-buffer-window or setting it
+          (cl-letf (((symbol-function 'get-buffer-window)
+                     (lambda (b &optional _v) (and (memq b (list all-buf err-buf)) (selected-window)))))
+            (logx-info :cat 't1 :msg "An informational message")
+            (logx-error :cat 't1 :msg "A critical failure message")
+            (logx--flush-active-viewers))
+
+          ;; Check all-buf has both
+          (with-current-buffer all-buf
+            (should (string-match-p "An informational message" (buffer-string)))
+            (should (string-match-p "A critical failure message" (buffer-string))))
+
+          ;; Check err-buf has only error
+          (with-current-buffer err-buf
+            (should-not (string-match-p "An informational message" (buffer-string)))
+            (should (string-match-p "A critical failure message" (buffer-string)))))
+      (logx-unregister-viewer all-buf)
+      (logx-unregister-viewer err-buf)
+      (when (buffer-live-p all-buf) (kill-buffer all-buf))
+      (when (buffer-live-p err-buf) (kill-buffer err-buf)))))
+
+(ert-deftest test-logx-alert-sink ()
+  "Verify alert.el notifications are routed to logx ring buffer."
+  (logx--ring-clear)
+  (logx-alert-sink '(:message "Alert test notification"
+                     :severity urgent
+                     :category test-alert))
+  (let ((items (logx--ring-to-list)))
+    (should (= (length items) 1))
+    (let ((ev (car items)))
+      (should (eq (plist-get ev :lvl) 'error))
+      (should (string-match-p "Alert test notification" (plist-get ev :msg))))))
+
 (provide 'test-logx)
 ;;; test-logx.el ends here

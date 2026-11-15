@@ -622,6 +622,8 @@ PREV-TS is preceding timestamp for relative offset."
 ;;; Major Mode Definition and Keymap
 ;;; ----------------------------------------------------------------------------
 
+(declare-function logx-fork-filtered-buffer "logx" (name filter-pred))
+
 (defvar jsonl-view-mode-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "TAB")     #'jsonl-view-toggle-disclosure)
@@ -629,6 +631,7 @@ PREV-TS is preceding timestamp for relative offset."
     (define-key map (kbd "<backtab>") #'jsonl-view-collapse-all)
     (define-key map (kbd "S-TAB")   #'jsonl-view-collapse-all)
     (define-key map (kbd "i")       #'jsonl-view-toggle-info)
+    (define-key map (kbd "B")       #'logx-fork-filtered-buffer)
     (define-key map (kbd "RET")     #'jsonl-view-jump-to-source)
     (define-key map (kbd "t")       #'jsonl-view-cycle-timestamp-mode)
     (define-key map (kbd "l")       #'jsonl-view-filter-level)

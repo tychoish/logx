@@ -29,6 +29,9 @@
 (require 'map)
 (require 'json)
 
+;; Required for viewer rendering
+(require 'jsonl-view)
+
 ;; Optional low-level dependency
 (require 'jsonl nil t)
 
@@ -290,6 +293,12 @@ If LIMIT is non-nil, return at most LIMIT entries."
 ;;; Event Emission Pipeline
 ;;; ----------------------------------------------------------------------------
 
+(defvar logx--pending-events nil
+  "List of events emitted since last batch flush, in reverse chronological order.")
+
+(defvar logx--flush-timer nil
+  "Timer driving the throttled viewer buffer flush.")
+
 (defun logx--emit-event (level category msg src data)
   "Construct, store, and dispatch structured event record."
   (let ((event (list :seq (cl-incf logx--ring-seq)
@@ -302,8 +311,127 @@ If LIMIT is non-nil, return at most LIMIT entries."
     (logx--ring-push event)
     (when logx-log-file
       (logx--disk-appender event))
+    (push event logx--pending-events)
+    (logx--schedule-flush)
     (run-hook-with-args 'logx-event-hook event)
     event))
+
+;;; ----------------------------------------------------------------------------
+;;; Live Ring Buffer Renderer & Multi-Buffer Views (*logs*, *logs:<filter>*)
+;;; ----------------------------------------------------------------------------
+
+(defcustom logx-render-interval 0.05
+  "Interval in seconds between throttled batch flushes to visible viewer buffers."
+  :type 'number
+  :group 'logx)
+
+(defcustom logx-viewer-buffer-max-lines 10000
+  "Maximum number of lines retained in live viewer buffers before truncation."
+  :type 'integer
+  :group 'logx)
+
+(defvar logx--active-viewers nil
+  "Alist of (BUFFER . PREDICATE) active live viewer buffers.")
+
+(defun logx-register-viewer (buffer &optional predicate)
+  "Register BUFFER to receive live events matching PREDICATE."
+  (setq logx--active-viewers
+        (cons (cons buffer (or predicate (lambda (_ev) t)))
+              (assq-delete-all buffer logx--active-viewers))))
+
+(defun logx-unregister-viewer (buffer)
+  "Unregister BUFFER from live log event delivery."
+  (setq logx--active-viewers (assq-delete-all buffer logx--active-viewers)))
+
+(defun logx--flush-active-viewers ()
+  "Flush pending events to all visible subscriber viewer buffers in batches."
+  (setq logx--flush-timer nil)
+  (when logx--pending-events
+    (let ((events (nreverse logx--pending-events)))
+      (setq logx--pending-events nil)
+      ;; Clean dead buffers from registry
+      (setq logx--active-viewers
+            (seq-filter (lambda (entry) (buffer-live-p (car entry)))
+                        logx--active-viewers))
+      (dolist (entry logx--active-viewers)
+        (let ((buf (car entry))
+              (pred (cdr entry)))
+          (when (and (buffer-live-p buf)
+                     ;; Visibility gating: only insert if displayed in a window
+                     (get-buffer-window buf 'visible))
+            (with-current-buffer buf
+              (let ((inhibit-read-only t)
+                    (orig-window (get-buffer-window buf))
+                    (should-follow jsonl-view-follow-mode))
+                (save-excursion
+                  (goto-char (point-max))
+                  (dolist (ev events)
+                    (when (funcall pred ev)
+                      (insert (jsonl-view-render-record ev))))
+                  ;; Enforce buffer size limit
+                  (when (> (count-lines (point-min) (point-max)) logx-viewer-buffer-max-lines)
+                    (let ((excess (- (count-lines (point-min) (point-max)) logx-viewer-buffer-max-lines)))
+                      (goto-char (point-min))
+                      (forward-line excess)
+                      (delete-region (point-min) (point)))))
+                ;; Auto-scroll if follow mode is active
+                (when (and should-follow orig-window)
+                  (with-selected-window orig-window
+                    (goto-char (point-max))))))))))))
+
+(defun logx--schedule-flush ()
+  "Ensure a throttled flush timer is scheduled."
+  (unless logx--flush-timer
+    (setq logx--flush-timer
+          (run-with-timer logx-render-interval nil #'logx--flush-active-viewers))))
+
+;;;###autoload
+(defun logx-show-logs (&optional buffer-name)
+  "Display master structured logs viewer buffer, or BUFFER-NAME if specified."
+  (interactive)
+  (let* ((name (or buffer-name "*logs*"))
+         (buf (get-buffer-create name)))
+    (with-current-buffer buf
+      (unless (eq major-mode 'jsonl-view-mode)
+        (jsonl-view-mode)
+        (setq-local jsonl-view-follow-mode t)
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (dolist (ev (logx--ring-to-list))
+            (insert (jsonl-view-render-record ev))))
+        (goto-char (point-max))))
+    (logx-register-viewer buf)
+    (pop-to-buffer buf)))
+
+;;;###autoload
+(defun logx-fork-filtered-buffer (name filter-pred)
+  "Create and display a specialized live viewer buffer.
+Creates *logs:NAME* containing events matching FILTER-PRED."
+  (interactive
+   (let* ((n (read-string "Filtered buffer name suffix (e.g. error, asq): "))
+          (min-lvl (intern (completing-read "Minimum severity: "
+                                            '("debug" "info" "notice" "warn" "error" "fatal")
+                                            nil t nil nil "info")))
+          (cat-rx (read-string "Category regex (empty for all): ")))
+     (list n
+           (lambda (ev)
+             (let ((l (plist-get ev :lvl))
+                   (c (format "%s" (or (plist-get ev :cat) ""))))
+               (and (>= (logx-level-weight l) (logx-level-weight min-lvl))
+                    (if (string-empty-p cat-rx) t (string-match-p cat-rx c))))))))
+  (let* ((buf-name (format "*logs:%s*" name))
+         (buf (get-buffer-create buf-name)))
+    (with-current-buffer buf
+      (jsonl-view-mode)
+      (setq-local jsonl-view-follow-mode t)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (dolist (ev (logx--ring-to-list))
+          (when (funcall filter-pred ev)
+            (insert (jsonl-view-render-record ev))))
+        (goto-char (point-max))))
+    (logx-register-viewer buf filter-pred)
+    (pop-to-buffer buf)))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Macro Expansion & Public Logging API
