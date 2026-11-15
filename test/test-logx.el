@@ -6,10 +6,10 @@
 ;;; Code:
 
 (require 'ert)
-(require 'logx (expand-file-name "../logx.el" (file-name-directory (or load-file-name buffer-file-name))))
+(require 'logx)
 
 (ert-deftest test-logx-level-weights ()
-  "Verify numeric weights and progression of severity levels."
+  "Verify numeric weights and progression of all 8 severity levels."
   (should (< (logx-level-weight 'debug)
              (logx-level-weight 'info)))
   (should (< (logx-level-weight 'info)
@@ -19,17 +19,24 @@
   (should (< (logx-level-weight 'warn)
              (logx-level-weight 'error)))
   (should (< (logx-level-weight 'error)
+             (logx-level-weight 'critical)))
+  (should (< (logx-level-weight 'critical)
+             (logx-level-weight 'alert)))
+  (should (< (logx-level-weight 'alert)
              (logx-level-weight 'fatal))))
 
 (ert-deftest test-logx-level-gating ()
   "Verify global and category-specific severity thresholds."
   (let ((logx-default-level 'info)
-        (logx-category-levels (make-hash-table :test #'equal)))
+        (logx-category-levels nil))
     ;; Global threshold checks
     (should-not (logx--level-enabled-p 'debug))
     (should (logx--level-enabled-p 'info))
     (should (logx--level-enabled-p 'warn))
     (should (logx--level-enabled-p 'error))
+    (should (logx--level-enabled-p 'critical))
+    (should (logx--level-enabled-p 'alert))
+    (should (logx--level-enabled-p 'fatal))
 
     ;; Category-specific override
     (logx-set-category-level 'mcp.proxy 'debug)
@@ -51,17 +58,27 @@
 
     ;; Level is error >= warn -> side-effect expression evaluates
     (logx-error :cat 'test :msg (setq side-effect-flag t))
-    (should side-effect-flag)))
+    (should side-effect-flag)
+
+    ;; Test critical and alert macros
+    (setq side-effect-flag nil)
+    (logx-critical :cat 'test :msg (setq side-effect-flag 'critical))
+    (should (eq side-effect-flag 'critical))
+
+    (setq side-effect-flag nil)
+    (logx-alert :cat 'test :msg (setq side-effect-flag 'alert))
+    (should (eq side-effect-flag 'alert))))
 
 (ert-deftest test-logx-ring-buffer-operations ()
-  "Verify O(1) push, circular wrap-around, and FIFO retrieval."
+  "Verify standard library ring.el push, circular wrap-around, and FIFO retrieval."
   (let ((logx-ring-buffer-size 3))
     (logx--ring-init 3)
-    (should (= (length (logx--ring-to-list)) 0))
+    (should (= (logx--ring-length) 0))
 
     ;; Push 2 items
     (logx--ring-push '(:id 1 :msg "first"))
     (logx--ring-push '(:id 2 :msg "second"))
+    (should (= (logx--ring-length) 2))
     (let ((items (logx--ring-to-list)))
       (should (= (length items) 2))
       (should (= (plist-get (car items) :id) 1))
@@ -69,7 +86,7 @@
 
     ;; Push 3rd item (full)
     (logx--ring-push '(:id 3 :msg "third"))
-    (should (= (length (logx--ring-to-list)) 3))
+    (should (= (logx--ring-length) 3))
 
     ;; Push 4th item (wrap around: 1 is discarded)
     (logx--ring-push '(:id 4 :msg "fourth"))
@@ -81,7 +98,18 @@
 
     ;; Clear
     (logx--ring-clear)
-    (should (= (length (logx--ring-to-list)) 0))))
+    (should (= (logx--ring-length) 0))))
+
+(ert-deftest test-logx-subscriber-dispatch ()
+  "Verify event delivery to registered subscribers."
+  (let ((received nil))
+    (logx-register-subscriber 'test-sub (lambda (ev) (push ev received)))
+    (unwind-protect
+        (progn
+          (logx-info :cat 'dispatch :msg "Test message 1")
+          (should (= (length received) 1))
+          (should (equal (plist-get (car received) :msg) "Test message 1")))
+      (logx-unregister-subscriber 'test-sub))))
 
 (ert-deftest test-logx-object-sanitizer ()
   "Verify non-JSON Lisp primitives and cycles are safely converted."
@@ -109,7 +137,6 @@
     (setf (cadr (cddr cyclic-list)) cyclic-list)
     (let ((sanitized (logx--sanitize-value cyclic-list)))
       (should (listp sanitized))
-      ;; Must not hang or blow stack
       (should (member "[Circular Reference]" sanitized))))
 
   ;; Deep recursion
@@ -151,81 +178,6 @@
               (should (string-match-p "Disk append event 2" (cadr lines))))))
       (when (file-exists-p tmp-file)
         (delete-file tmp-file)))))
-
-(ert-deftest test-logx-live-viewer-flush ()
-  "Verify live viewer receives batched events."
-  (let* ((buf (generate-new-buffer "*logx-test-viewer*"))
-         (logx-default-level 'info))
-    (unwind-protect
-        (progn
-          (with-current-buffer buf
-            (jsonl-view-mode))
-          ;; Display buffer in a window so visibility check passes
-          (set-window-buffer (selected-window) buf)
-          (logx-register-viewer buf)
-
-          ;; Emit events
-          (logx-info :cat 'live :msg "Live event 1")
-          (logx-info :cat 'live :msg "Live event 2")
-
-          ;; Run synchronous flush
-          (logx--flush-active-viewers)
-
-          (with-current-buffer buf
-            (let ((content (buffer-string)))
-              (should (string-match-p "Live event 1" content))
-              (should (string-match-p "Live event 2" content)))))
-      (logx-unregister-viewer buf)
-      (when (buffer-live-p buf)
-        (kill-buffer buf)))))
-
-(ert-deftest test-logx-multi-buffer-filtered-views ()
-  "Verify specialized filtered buffers receive only matching events."
-  (let* ((all-buf (generate-new-buffer "*logx-all*"))
-         (err-buf (generate-new-buffer "*logx-errors*"))
-         (logx-default-level 'debug))
-    (unwind-protect
-        (progn
-          (with-current-buffer all-buf (jsonl-view-mode))
-          (with-current-buffer err-buf (jsonl-view-mode))
-          (set-window-buffer (selected-window) all-buf)
-
-          ;; Register all-buf for all events, err-buf for only error/fatal
-          (logx-register-viewer all-buf (lambda (_ev) t))
-          (logx-register-viewer err-buf (lambda (ev) (eq (plist-get ev :lvl) 'error)))
-
-          ;; Pretend err-buf is also visible by mocking get-buffer-window or setting it
-          (cl-letf (((symbol-function 'get-buffer-window)
-                     (lambda (b &optional _v) (and (memq b (list all-buf err-buf)) (selected-window)))))
-            (logx-info :cat 't1 :msg "An informational message")
-            (logx-error :cat 't1 :msg "A critical failure message")
-            (logx--flush-active-viewers))
-
-          ;; Check all-buf has both
-          (with-current-buffer all-buf
-            (should (string-match-p "An informational message" (buffer-string)))
-            (should (string-match-p "A critical failure message" (buffer-string))))
-
-          ;; Check err-buf has only error
-          (with-current-buffer err-buf
-            (should-not (string-match-p "An informational message" (buffer-string)))
-            (should (string-match-p "A critical failure message" (buffer-string)))))
-      (logx-unregister-viewer all-buf)
-      (logx-unregister-viewer err-buf)
-      (when (buffer-live-p all-buf) (kill-buffer all-buf))
-      (when (buffer-live-p err-buf) (kill-buffer err-buf)))))
-
-(ert-deftest test-logx-alert-sink ()
-  "Verify alert.el notifications are routed to logx ring buffer."
-  (logx--ring-clear)
-  (logx-alert-sink '(:message "Alert test notification"
-                     :severity urgent
-                     :category test-alert))
-  (let ((items (logx--ring-to-list)))
-    (should (= (length items) 1))
-    (let ((ev (car items)))
-      (should (eq (plist-get ev :lvl) 'error))
-      (should (string-match-p "Alert test notification" (plist-get ev :msg))))))
 
 (provide 'test-logx)
 ;;; test-logx.el ends here

@@ -2,8 +2,8 @@
 
 ;; Author: sam kleinman <sam@tychoish.com>
 ;; Maintainer: sam kleinman <sam@tychoish.com>
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (jsonl "0.0.1"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "29.1"))
 ;; Keywords: tools, convenience, logging
 ;; URL: https://github.com/tychoish/logx
 
@@ -15,12 +15,12 @@
 ;;
 ;; Features:
 ;; - Zero-cost disabled logging fast-path via severity gating macros.
-;; - Compile-time call-site source tracking via `symbol-with-pos`.
-;; - In-memory fixed-capacity circular ring buffer with zero-allocation append.
-;; - Multi-buffer filtered dispatching (*logs*, *logs:<filter>*, *logs:<category>*).
-;; - Fast C-level JSON Lines (`json-serialize`) disk appender with object sanitization.
+;; - Compile-time call-site source tracking via `symbol-with-pos'.
+;; - Standard library `ring.el' circular ring buffer with zero-allocation append.
+;; - Severity levels: debug, info, notice, warn, error, critical, alert, fatal.
+;; - Fast C-level JSON Lines (`json-serialize') disk appender with object sanitization.
 ;; - Optional message-quarantine mode to silence chatty background subsystems.
-;; - Plug-and-play `alert.el` sink integration.
+;; - Headless core: decoupled from UI viewers via autoloads.
 
 ;;; Code:
 
@@ -28,12 +28,7 @@
 (require 'subr-x)
 (require 'map)
 (require 'json)
-
-;; Required for viewer rendering
-(require 'jsonl-view)
-
-;; Optional low-level dependency
-(require 'jsonl nil t)
+(require 'ring)
 
 (defgroup logx nil
   "High-performance structured logging framework."
@@ -45,12 +40,14 @@
 ;;; ----------------------------------------------------------------------------
 
 (defconst logx--severity-weights
-  '((debug  . 10)
-    (info   . 20)
-    (notice . 30)
-    (warn   . 40)
-    (error  . 50)
-    (fatal  . 60))
+  '((debug    . 10)
+    (info     . 20)
+    (notice   . 30)
+    (warn     . 40)
+    (error    . 50)
+    (critical . 60)
+    (alert    . 70)
+    (fatal    . 80))
   "Alist mapping severity symbols to numeric priorities.")
 
 (defcustom logx-default-level 'info
@@ -60,12 +57,14 @@
                  (const :tag "Notice" notice)
                  (const :tag "Warn" warn)
                  (const :tag "Error" error)
+                 (const :tag "Critical" critical)
+                 (const :tag "Alert" alert)
                  (const :tag "Fatal" fatal))
   :group 'logx)
 
-(defcustom logx-category-levels (make-hash-table :test #'equal)
-  "Hash table mapping category symbols or strings to severity thresholds."
-  :type 'sexp
+(defcustom logx-category-levels nil
+  "Alist mapping category symbols or strings to severity thresholds."
+  :type '(alist :key-type (choice symbol string) :value-type symbol)
   :group 'logx)
 
 (defcustom logx-ring-buffer-size 10000
@@ -126,14 +125,12 @@ Returns a plist (:file FILE :path PATH :line LINE :fn FN)."
                (and (consp byte-compile-current-form)
                     (memq (car byte-compile-current-form) '(defun cl-defun defmacro))
                     (cadr byte-compile-current-form)))))
-    ;; Attempt symbol-with-pos extraction in byte-compiled context
     (when (and (fboundp 'symbol-with-pos-p)
                (fboundp 'symbol-with-pos-pos)
                (symbol-with-pos-p macro-sym))
       (let ((pos (symbol-with-pos-pos macro-sym)))
         (when (numberp pos)
           (setq line (line-number-at-pos pos)))))
-    ;; Fall back to active buffer position if evaluating in buffer
     (unless line
       (setq line (ignore-errors (line-number-at-pos))))
     (list :file (and file (file-name-nondirectory file))
@@ -187,7 +184,6 @@ and guards against circular references via SEEN."
           "[Circular Reference]"
         (let ((new-seen (cons val seen)))
           (if (keywordp (car val))
-              ;; Plist: preserve keyword symbols as keys
               (let ((res nil)
                     (tail val))
                 (while (and (consp tail) (keywordp (car tail)))
@@ -195,7 +191,6 @@ and guards against circular references via SEEN."
                   (push (logx--sanitize-value (cadr tail) (1+ d) md new-seen) res)
                   (setq tail (cddr tail)))
                 (nreverse res))
-            ;; General list
             (mapcar (lambda (elem)
                       (logx--sanitize-value elem (1+ d) md new-seen))
                     val)))))
@@ -203,17 +198,11 @@ and guards against circular references via SEEN."
      (t (format "%s" val)))))
 
 ;;; ----------------------------------------------------------------------------
-;;; Circular Ring Buffer
+;;; Ring Buffer (using standard library ring.el)
 ;;; ----------------------------------------------------------------------------
 
-(defvar logx--ring-vector nil
-  "Vector backing store for the circular ring buffer.")
-
-(defvar logx--ring-head 0
-  "Index where the next event will be written.")
-
-(defvar logx--ring-count 0
-  "Total number of active events currently stored.")
+(defvar logx--ring (make-ring 10000)
+  "Standard library ring buffer retaining recent structured log events.")
 
 (defvar logx--ring-seq 0
   "Monotonically increasing sequence number for log events.")
@@ -222,44 +211,41 @@ and guards against circular references via SEEN."
 (defun logx--ring-init (&optional size)
   "Initialize or reallocate the ring buffer with capacity SIZE."
   (let ((cap (or size logx-ring-buffer-size 10000)))
-    (setq logx--ring-vector (make-vector cap nil)
-          logx--ring-head 0
-          logx--ring-count 0
+    (setq logx--ring (make-ring cap)
           logx--ring-seq 0)))
 
 ;;;###autoload
 (defun logx--ring-push (event)
   "Push EVENT into the circular ring buffer in O(1) time.
 Overwrites the oldest element when the buffer is full."
-  (unless logx--ring-vector
+  (unless (ring-p logx--ring)
     (logx--ring-init))
-  (let ((cap (length logx--ring-vector)))
-    (aset logx--ring-vector logx--ring-head event)
-    (setq logx--ring-head (% (1+ logx--ring-head) cap))
-    (when (< logx--ring-count cap)
-      (cl-incf logx--ring-count))
-    event))
+  (ring-insert logx--ring event)
+  event)
 
 ;;;###autoload
 (defun logx--ring-clear ()
-  "Reset ring buffer pointers without reallocating vector."
-  (setq logx--ring-head 0
-        logx--ring-count 0))
+  "Reset ring buffer contents without altering capacity."
+  (when (ring-p logx--ring)
+    (setq logx--ring (make-ring (ring-size logx--ring)))))
 
 ;;;###autoload
 (defun logx--ring-to-list (&optional limit)
   "Return ring buffer events ordered from oldest to newest.
 If LIMIT is non-nil, return at most LIMIT entries."
-  (unless logx--ring-vector
+  (unless (ring-p logx--ring)
     (logx--ring-init))
-  (let* ((cap (length logx--ring-vector))
-         (count (if limit (min limit logx--ring-count) logx--ring-count))
-         (start-idx (% (+ (- logx--ring-head logx--ring-count) cap) cap))
-         (res nil))
-    (dotimes (i count)
-      (let ((idx (% (+ start-idx i) cap)))
-        (push (aref logx--ring-vector idx) res)))
-    (nreverse res)))
+  (let ((elems (nreverse (ring-elements logx--ring))))
+    (if (and limit (< limit (length elems)))
+        (seq-take elems limit)
+      elems)))
+
+;;;###autoload
+(defun logx--ring-length ()
+  "Return the number of events currently held in the ring buffer."
+  (if (ring-p logx--ring)
+      (ring-length logx--ring)
+    0))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Serialization and Disk Sink
@@ -290,14 +276,23 @@ If LIMIT is non-nil, return at most LIMIT entries."
        (message "[logx] Disk appender failed: %s" (error-message-string err))))))
 
 ;;; ----------------------------------------------------------------------------
-;;; Event Emission Pipeline
+;;; Event Emission Pipeline & Headless Subscriber Dispatch
 ;;; ----------------------------------------------------------------------------
 
-(defvar logx--pending-events nil
-  "List of events emitted since last batch flush, in reverse chronological order.")
+(defvar logx--active-subscribers nil
+  "Alist of (ID-OR-BUFFER . HANDLER) active event subscribers.")
 
-(defvar logx--flush-timer nil
-  "Timer driving the throttled viewer buffer flush.")
+;;;###autoload
+(defun logx-register-subscriber (id handler)
+  "Register subscriber ID with HANDLER function called on each event."
+  (setq logx--active-subscribers
+        (cons (cons id handler)
+              (assq-delete-all id logx--active-subscribers))))
+
+;;;###autoload
+(defun logx-unregister-subscriber (id)
+  "Unregister subscriber ID from log event delivery."
+  (setq logx--active-subscribers (assq-delete-all id logx--active-subscribers)))
 
 (defun logx--emit-event (level category msg src data)
   "Construct, store, and dispatch structured event record."
@@ -311,127 +306,12 @@ If LIMIT is non-nil, return at most LIMIT entries."
     (logx--ring-push event)
     (when logx-log-file
       (logx--disk-appender event))
-    (push event logx--pending-events)
-    (logx--schedule-flush)
+    (dolist (sub logx--active-subscribers)
+      (condition-case nil
+          (funcall (cdr sub) event)
+        (error nil)))
     (run-hook-with-args 'logx-event-hook event)
     event))
-
-;;; ----------------------------------------------------------------------------
-;;; Live Ring Buffer Renderer & Multi-Buffer Views (*logs*, *logs:<filter>*)
-;;; ----------------------------------------------------------------------------
-
-(defcustom logx-render-interval 0.05
-  "Interval in seconds between throttled batch flushes to visible viewer buffers."
-  :type 'number
-  :group 'logx)
-
-(defcustom logx-viewer-buffer-max-lines 10000
-  "Maximum number of lines retained in live viewer buffers before truncation."
-  :type 'integer
-  :group 'logx)
-
-(defvar logx--active-viewers nil
-  "Alist of (BUFFER . PREDICATE) active live viewer buffers.")
-
-(defun logx-register-viewer (buffer &optional predicate)
-  "Register BUFFER to receive live events matching PREDICATE."
-  (setq logx--active-viewers
-        (cons (cons buffer (or predicate (lambda (_ev) t)))
-              (assq-delete-all buffer logx--active-viewers))))
-
-(defun logx-unregister-viewer (buffer)
-  "Unregister BUFFER from live log event delivery."
-  (setq logx--active-viewers (assq-delete-all buffer logx--active-viewers)))
-
-(defun logx--flush-active-viewers ()
-  "Flush pending events to all visible subscriber viewer buffers in batches."
-  (setq logx--flush-timer nil)
-  (when logx--pending-events
-    (let ((events (nreverse logx--pending-events)))
-      (setq logx--pending-events nil)
-      ;; Clean dead buffers from registry
-      (setq logx--active-viewers
-            (seq-filter (lambda (entry) (buffer-live-p (car entry)))
-                        logx--active-viewers))
-      (dolist (entry logx--active-viewers)
-        (let ((buf (car entry))
-              (pred (cdr entry)))
-          (when (and (buffer-live-p buf)
-                     ;; Visibility gating: only insert if displayed in a window
-                     (get-buffer-window buf 'visible))
-            (with-current-buffer buf
-              (let ((inhibit-read-only t)
-                    (orig-window (get-buffer-window buf))
-                    (should-follow jsonl-view-follow-mode))
-                (save-excursion
-                  (goto-char (point-max))
-                  (dolist (ev events)
-                    (when (funcall pred ev)
-                      (insert (jsonl-view-render-record ev))))
-                  ;; Enforce buffer size limit
-                  (when (> (count-lines (point-min) (point-max)) logx-viewer-buffer-max-lines)
-                    (let ((excess (- (count-lines (point-min) (point-max)) logx-viewer-buffer-max-lines)))
-                      (goto-char (point-min))
-                      (forward-line excess)
-                      (delete-region (point-min) (point)))))
-                ;; Auto-scroll if follow mode is active
-                (when (and should-follow orig-window)
-                  (with-selected-window orig-window
-                    (goto-char (point-max))))))))))))
-
-(defun logx--schedule-flush ()
-  "Ensure a throttled flush timer is scheduled."
-  (unless logx--flush-timer
-    (setq logx--flush-timer
-          (run-with-timer logx-render-interval nil #'logx--flush-active-viewers))))
-
-;;;###autoload
-(defun logx-show-logs (&optional buffer-name)
-  "Display master structured logs viewer buffer, or BUFFER-NAME if specified."
-  (interactive)
-  (let* ((name (or buffer-name "*logs*"))
-         (buf (get-buffer-create name)))
-    (with-current-buffer buf
-      (unless (eq major-mode 'jsonl-view-mode)
-        (jsonl-view-mode)
-        (setq-local jsonl-view-follow-mode t)
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (dolist (ev (logx--ring-to-list))
-            (insert (jsonl-view-render-record ev))))
-        (goto-char (point-max))))
-    (logx-register-viewer buf)
-    (pop-to-buffer buf)))
-
-;;;###autoload
-(defun logx-fork-filtered-buffer (name filter-pred)
-  "Create and display a specialized live viewer buffer.
-Creates *logs:NAME* containing events matching FILTER-PRED."
-  (interactive
-   (let* ((n (read-string "Filtered buffer name suffix (e.g. error, asq): "))
-          (min-lvl (intern (completing-read "Minimum severity: "
-                                            '("debug" "info" "notice" "warn" "error" "fatal")
-                                            nil t nil nil "info")))
-          (cat-rx (read-string "Category regex (empty for all): ")))
-     (list n
-           (lambda (ev)
-             (let ((l (plist-get ev :lvl))
-                   (c (format "%s" (or (plist-get ev :cat) ""))))
-               (and (>= (logx-level-weight l) (logx-level-weight min-lvl))
-                    (if (string-empty-p cat-rx) t (string-match-p cat-rx c))))))))
-  (let* ((buf-name (format "*logs:%s*" name))
-         (buf (get-buffer-create buf-name)))
-    (with-current-buffer buf
-      (jsonl-view-mode)
-      (setq-local jsonl-view-follow-mode t)
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (dolist (ev (logx--ring-to-list))
-          (when (funcall filter-pred ev)
-            (insert (jsonl-view-render-record ev))))
-        (goto-char (point-max))))
-    (logx-register-viewer buf filter-pred)
-    (pop-to-buffer buf)))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Macro Expansion & Public Logging API
@@ -505,6 +385,18 @@ ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs."
   (logx--expand-macro 'error args 'logx-error))
 
 ;;;###autoload
+(defmacro logx-critical (&rest args)
+  "Emit a CRITICAL level log event.
+ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs."
+  (logx--expand-macro 'critical args 'logx-critical))
+
+;;;###autoload
+(defmacro logx-alert (&rest args)
+  "Emit an ALERT level log event.
+ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs."
+  (logx--expand-macro 'alert args 'logx-alert))
+
+;;;###autoload
 (defmacro logx-fatal (&rest args)
   "Emit a FATAL level log event.
 ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs."
@@ -520,7 +412,7 @@ ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs."
 (defun logx--caller-matches-quarantine-p (pkgs)
   "Return non-nil if caller stack matches any package prefix in PKGS."
   (let ((matched nil)
-        (frame-idx 3)) ;; Skip advice internal frames
+        (frame-idx 3))
     (while (and (not matched) (< frame-idx 20))
       (let ((frame (backtrace-frame frame-idx)))
         (when frame
@@ -569,31 +461,8 @@ ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs."
       (advice-add 'message :around #'logx--message-advice)
     (advice-remove 'message #'logx--message-advice)))
 
-;;; ----------------------------------------------------------------------------
-;;; Alert.el Integration Sink
-;;; ----------------------------------------------------------------------------
-
-;;;###autoload
-(defun logx-alert-sink (info)
-  "Route `alert' notification INFO plist into `logx' structured logging."
-  (let* ((sev (or (plist-get info :severity) 'normal))
-         (level (pcase sev
-                  ('urgent 'error)
-                  ('high 'warn)
-                  ('low 'debug)
-                  (_ 'info)))
-         (cat (or (plist-get info :category) 'alert))
-         (title (plist-get info :title))
-         (msg (plist-get info :message))
-         (combined-msg (if title (format "[%s] %s" title msg) msg)))
-    (logx--emit-event level (intern (format "%s" cat)) combined-msg nil info)))
-
-(with-eval-after-load 'alert
-  (declare-function alert-define-style "alert" (name &rest args))
-  (when (fboundp 'alert-define-style)
-    (alert-define-style 'logx
-                        :title "Logx Structured Logger"
-                        :notifier #'logx-alert-sink)))
+;;;###autoload (autoload 'logx-show-logs "logx-view" "Display master structured logs viewer buffer." t)
+;;;###autoload (autoload 'logx-fork-filtered-buffer "logx-view" "Create specialized live viewer buffer." t)
 
 (provide 'logx)
 ;;; logx.el ends here
