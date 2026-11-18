@@ -125,6 +125,7 @@ git clone https://github.com/tychoish/logx.git ~/src/logx
 | Option | Type | Default | Description |
 |--------+------+---------+-------------|
 | ~logx-default-level~ | symbol | ='info= | Global minimum logging severity threshold |
+| ~logx-default-event-level~ | symbol | ='debug= | Default severity when not specified in ~logx~ |
 | ~logx-category-levels~ | alist | =nil= | Category-specific threshold overrides |
 | ~logx-ring-buffer-size~ | integer | =10000= | Max events retained in circular ring buffer |
 | ~logx-log-file~ | string/nil | =nil= | Path for appending JSON Lines records to disk |
@@ -152,13 +153,22 @@ Emit structured events with key-value pairs. Keys can be keyword symbols, string
 #+BEGIN_SRC emacs-lisp
 (require 'logx)
 
-;; Basic info logging
-(logx-info :cat 'auth :msg "User logged in" :uid 1001 :ip "127.0.0.1")
+;; Unified `logx' macro with explicit or aliased severity level
+(logx 'info "User logged in" :cat 'auth :uid 1001 :ip "127.0.0.1")
+(logx 'warning "Slow query detected" :domain 'db :duration-ms 4200)
+(logx 'trace "Entering cache lookup" :key "user:1001")
 
-;; Warning with telemetry attributes
-(logx-warn :cat 'db :msg "Slow query detected" :duration-ms 4200 :query "SELECT ...")
+;; Untagged: uses `logx-default-event-level' (default: 'debug)
+(logx "Untagged background event" :item "task-1")
 
-;; High severity levels
+;; Aliases: :category / :domain for :cat, and :message for :msg
+(logx-info :category 'auth :message "User logged in" :uid 1001)
+
+;; Positional message strings and dynamic expressions (supported in all macros)
+(logx-info "Service started" :port 8080)
+(logx-warn (format "Disk %s low" path) :free-gb 2)
+
+;; Dedicated level macros
 (logx-critical :cat 'billing :msg "Gateway unresponsive" :retries 3)
 (logx-alert :cat 'security :msg "Multiple failed authentications" :target "admin")
 (logx-fatal :cat 'system :msg "Out of memory" :free-bytes 0)
@@ -255,6 +265,7 @@ Key benchmark highlights on GNU Emacs 31.1:
 
 | Symbol / Command | Kind | Description |
 |------------------+------+-------------|
+| ~logx~ | Macro | Emit a structured log event with optional leading severity level |
 | [[#logx-debug][~logx-debug~]] | Macro | Emit a DEBUG level log event |
 | [[#logx-info][~logx-info~]] | Macro | Emit an INFO level log event |
 | [[#logx-notice][~logx-notice~]] | Macro | Emit a NOTICE level log event |
@@ -264,6 +275,7 @@ Key benchmark highlights on GNU Emacs 31.1:
 | [[#logx-alert][~logx-alert~]] | Macro | Emit an ALERT level log event |
 | [[#logx-fatal][~logx-fatal~]] | Macro | Emit a FATAL level log event |
 | [[#logx-default-level][~logx-default-level~]] | Custom | Default minimum logging severity threshold |
+| ~logx-default-event-level~ | Custom | Default severity when not specified in ~logx~ |
 | [[#logx-category-levels][~logx-category-levels~]] | Custom | Alist mapping category symbols to severity thresholds |
 | [[#logx-log-file][~logx-log-file~]] | Custom | File path for appending JSON Lines log records |
 | [[#logx-ring-buffer-size][~logx-ring-buffer-size~]] | Custom | Maximum structured events retained in circular buffer |

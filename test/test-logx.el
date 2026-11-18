@@ -354,5 +354,95 @@
             (should (equal (plist-get (car intercepted) :msg) "Hello from mock background package 42"))))
       (logx-quarantine-mode -1))))
 
+(ert-deftest test-logx-unified-macro ()
+  "Verify the unified (logx ...) macro with explicit, aliased, and default levels."
+  (let ((logx-default-level 'debug)
+        (logx-default-event-level 'debug)
+        (logx-category-levels nil)
+        (events nil))
+    (cl-letf (((symbol-function 'logx--ring-push)
+               (lambda (ev) (push ev events) ev)))
+      ;; 1. Explicit quoted levels
+      (logx 'info "Hello info" :key1 1)
+      (should (eq (plist-get (car events) :lvl) 'info))
+      (should (equal (plist-get (car events) :msg) "Hello info"))
+      (should (equal (plist-get (car events) :data) '(:key1 1)))
+
+      ;; 2. Canonical level aliases: 'warning -> 'warn, 'trace -> 'debug
+      (logx 'warning "Warning message" :cat 'sys)
+      (should (eq (plist-get (car events) :lvl) 'warn))
+      (should (equal (plist-get (car events) :cat) 'sys))
+
+      (logx 'trace "Trace message")
+      (should (eq (plist-get (car events) :lvl) 'debug))
+      (should (equal (plist-get (car events) :msg) "Trace message"))
+
+      ;; 3. Bare symbol and keyword levels
+      (logx info "Bare symbol info")
+      (should (eq (plist-get (car events) :lvl) 'info))
+
+      (logx :warn "Keyword warn")
+      (should (eq (plist-get (car events) :lvl) 'warn))
+
+      ;; 4. Default level when omitted
+      (logx "Untagged message" :count 5)
+      (should (eq (plist-get (car events) :lvl) 'debug))
+      (should (equal (plist-get (car events) :msg) "Untagged message"))
+
+      ;; 5. Configurable default level override
+      (let ((logx-default-event-level 'warn))
+        (logx "Warning default" :count 10)
+        (should (eq (plist-get (car events) :lvl) 'warn))))))
+
+(ert-deftest test-logx-aliases-cat-msg ()
+  "Verify :category, :domain, and :message argument aliases."
+  (let ((logx-default-level 'debug)
+        (logx-default-event-level 'debug)
+        (events nil))
+    (cl-letf (((symbol-function 'logx--ring-push)
+               (lambda (ev) (push ev events) ev)))
+      ;; :category alias
+      (logx-info :category 'auth :message "User logged in")
+      (should (equal (plist-get (car events) :cat) 'auth))
+      (should (equal (plist-get (car events) :msg) "User logged in"))
+
+      ;; :domain alias
+      (logx 'notice :domain 'network :msg "Socket connected")
+      (should (equal (plist-get (car events) :cat) 'network))
+      (should (equal (plist-get (car events) :msg) "Socket connected"))
+
+      ;; Mixed positional message with :domain
+      (logx 'error "Database offline" :domain 'storage :code 500)
+      (should (equal (plist-get (car events) :cat) 'storage))
+      (should (equal (plist-get (car events) :msg) "Database offline"))
+      (should (equal (plist-get (car events) :data) '(:code 500))))))
+
+(ert-deftest test-logx-positional-strings-and-expressions ()
+  "Verify positional strings and dynamic expressions across all logging macros."
+  (let ((logx-default-level 'info)
+        (events nil))
+    (cl-letf (((symbol-function 'logx--ring-push)
+               (lambda (ev) (push ev events) ev)))
+      ;; Positional string in logx-info
+      (logx-info "Service started" :port 8080)
+      (should (equal (plist-get (car events) :msg) "Service started"))
+      (should (equal (plist-get (car events) :data) '(:port 8080)))
+
+      ;; Positional expression in logx-warn
+      (logx-warn (format "Disk %s near capacity" "/dev/sda1") :free-pct 5)
+      (should (equal (plist-get (car events) :msg) "Disk /dev/sda1 near capacity"))
+      (should (equal (plist-get (car events) :data) '(:free-pct 5)))
+
+      ;; Zero-cost disabled path for dynamic positional expressions
+      (let ((side-effect-flag nil))
+        (logx-debug (setq side-effect-flag t) :extra "val")
+        (should-not side-effect-flag))
+
+      (let ((logx-default-level 'error)
+            (logx-default-event-level 'debug)
+            (side-effect-flag nil))
+        (logx (setq side-effect-flag t) :extra "val")
+        (should-not side-effect-flag)))))
+
 (provide 'test-logx)
 ;;; test-logx.el ends here

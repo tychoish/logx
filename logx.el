@@ -62,6 +62,23 @@
                  (const :tag "Fatal" fatal))
   :group 'logx)
 
+(defcustom logx-default-event-level 'debug
+  "Default severity level for `logx' events when no level is specified."
+  :type '(choice (const :tag "Debug" debug)
+                 (const :tag "Info" info)
+                 (const :tag "Notice" notice)
+                 (const :tag "Warn" warn)
+                 (const :tag "Error" error)
+                 (const :tag "Critical" critical)
+                 (const :tag "Alert" alert)
+                 (const :tag "Fatal" fatal))
+  :group 'logx)
+
+(defconst logx--level-aliases
+  '((trace   . debug)
+    (warning . warn))
+  "Alist mapping severity aliases to canonical severity symbols.")
+
 (defcustom logx-category-levels nil
   "Alist mapping category symbols or strings to severity thresholds."
   :type '(alist :key-type (choice symbol string) :value-type symbol)
@@ -629,20 +646,42 @@ Returns the number of flushed events."
 ;;; Macro Expansion & Public Logging API
 ;;; ----------------------------------------------------------------------------
 
+(defun logx--canonical-level (form)
+  "Resolve FORM to a canonical severity symbol, or nil if not a recognized level.
+Supports quoted symbols (e.g. \\='info), unquoted symbols (e.g. info),
+and keywords (e.g. :info), mapping aliases like `warning' -> `warn'
+and `trace' -> `debug'."
+  (let* ((sym (cond
+               ((and (consp form) (eq (car form) 'quote) (symbolp (cadr form)))
+                (cadr form))
+               ((keywordp form)
+                (intern (substring (symbol-name form) 1)))
+               ((symbolp form)
+                form)
+               (t nil)))
+         (aliased (and sym (or (alist-get sym logx--level-aliases) sym))))
+    (and aliased (assq aliased logx--severity-weights) aliased)))
+
 (defun logx--parse-macro-args (args)
-  "Extract :cat, :msg, and remaining key-values from ARGS."
+  "Extract category, message, and remaining key-values from ARGS.
+Supports :cat, :category, and :domain for category; :msg and :message
+for message. If a non-keyword argument is encountered before a message
+keyword, it is treated as the positional log message."
   (let ((cat nil)
         (msg nil)
         (rest nil))
     (while args
       (let ((key (car args)))
         (cond
-         ((eq key :cat)
+         ((memq key '(:cat :category :domain))
           (setq cat (cadr args)
                 args (cddr args)))
-         ((eq key :msg)
+         ((memq key '(:msg :message))
           (setq msg (cadr args)
                 args (cddr args)))
+         ((and (null msg) (not (keywordp key)))
+          (setq msg key
+                args (cdr args)))
          ((keywordp key)
           (push key rest)
           (push (cadr args) rest)
@@ -665,6 +704,34 @@ Returns the number of flushed events."
                          ,msg-form
                          ',src
                          (list ,@data-forms)))))
+
+;;;###autoload
+(defmacro logx (&rest args)
+  "Emit a structured log event with optional leading severity LEVEL.
+When LEVEL is omitted, defaults to `logx-default-event-level'.
+LEVEL can be a quoted symbol (e.g. \\='info), bare symbol (e.g. info),
+or keyword (e.g. :info). Aliases like `warning' -> `warn' and
+`trace' -> `debug' are normalized automatically.
+
+ARGS can include a positional message string/expression, :cat (or
+:category, :domain), :msg (or :message), and arbitrary KEY VALUE pairs."
+  (let ((level (logx--canonical-level (car args))))
+    (if level
+        (logx--expand-macro level (cdr args) 'logx)
+      (let* ((parsed (logx--parse-macro-args args))
+             (cat-form (plist-get parsed :cat))
+             (msg-form (plist-get parsed :msg))
+             (data-forms (plist-get parsed :data))
+             (src (logx--capture-call-site 'logx)))
+        `(let ((lvl (or (and (boundp 'logx-default-event-level)
+                             logx-default-event-level)
+                        'debug)))
+           (when (logx--level-enabled-p lvl ,cat-form)
+             (logx--emit-event lvl
+                               ,cat-form
+                               ,msg-form
+                               ',src
+                               (list ,@data-forms))))))))
 
 ;;;###autoload
 (defmacro logx-debug (&rest args)
