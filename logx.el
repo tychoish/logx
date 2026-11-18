@@ -669,8 +669,9 @@ Returns the number of flushed events."
 ;;; ----------------------------------------------------------------------------
 
 (defun logx--canonical-level (form)
-  "Resolve FORM in macro args to a canonical severity symbol, or nil if not a level.
-Matches quoted symbols (e.g. \\='info) and keywords (e.g. :info)."
+  "Resolve FORM in macro args to a canonical severity symbol.
+Returns nil if not a level. Matches quoted symbols (e.g. \\='info)
+and keywords (e.g. :info)."
   (let ((sym (cond
               ((and (consp form) (eq (car form) 'quote) (symbolp (cadr form)))
                (cadr form))
@@ -723,7 +724,7 @@ When LEVEL is nil, dynamically evaluates `logx-default-event-level' at runtime."
      ;; 1. Static compile-time level (zero-cost path)
      (level
       (if (and cat-form (not (or (symbolp cat-form) (keywordp cat-form) (stringp cat-form))))
-          (let ((cat-sym (cl-gensym "cat-")))
+          (let ((cat-sym (gensym "cat-")))
             `(let ((,cat-sym ,cat-form))
                (when (logx--level-enabled-p ',level ,cat-sym)
                  (logx--emit-event ',level
@@ -740,9 +741,9 @@ When LEVEL is nil, dynamically evaluates `logx-default-event-level' at runtime."
 
      ;; 2. Dynamic runtime default level (hygienic gensym bindings)
      (t
-      (let ((lvl-sym (cl-gensym "lvl-")))
+      (let ((lvl-sym (gensym "lvl-")))
         (if (and cat-form (not (or (symbolp cat-form) (keywordp cat-form) (stringp cat-form))))
-            (let ((cat-sym (cl-gensym "cat-")))
+            (let ((cat-sym (gensym "cat-")))
               `(let ((,lvl-sym (or (and (boundp 'logx-default-event-level)
                                         logx-default-event-level)
                                    'debug))
