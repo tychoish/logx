@@ -495,5 +495,15 @@
       (should (equal (plist-get (car events) :msg) "Positional string"))
       (should (equal (plist-get (car events) :data) '(:msg "Explicit keyword message"))))))
 
+(ert-deftest test-logx-call-site-capture ()
+  "Verify call-site extraction when byte-compiling functions."
+  (require 'bytecomp)
+  (let ((byte-compile-current-form 'my-worker-function))
+    (let ((site (logx--capture-call-site 'logx-info)))
+      (should (eq (plist-get site :fn) 'my-worker-function))))
+  (let ((byte-compile-current-form '(defun my-other-function () nil)))
+    (let ((site (logx--capture-call-site 'logx-info)))
+      (should (eq (plist-get site :fn) 'my-other-function)))))
+
 (provide 'test-logx)
 ;;; test-logx.el ends here
