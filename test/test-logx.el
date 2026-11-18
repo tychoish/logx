@@ -23,7 +23,12 @@
   (should (< (logx-level-weight 'critical)
              (logx-level-weight 'alert)))
   (should (< (logx-level-weight 'alert)
-             (logx-level-weight 'fatal))))
+             (logx-level-weight 'fatal)))
+  ;; Verify alias resolution in logx-level-weight
+  (should (= (logx-level-weight 'warning) (logx-level-weight 'warn)))
+  (should (= (logx-level-weight 'trace) (logx-level-weight 'debug)))
+  (should (= (logx-level-weight :info) (logx-level-weight 'info)))
+  (should (= (logx-level-weight "warn") (logx-level-weight 'warn))))
 
 (ert-deftest test-logx-level-gating ()
   "Verify global and category-specific severity thresholds."
@@ -46,7 +51,12 @@
     ;; Category-specific threshold elevation
     (logx-set-category-level 'chatty.lib 'error)
     (should-not (logx--level-enabled-p 'warn 'chatty.lib))
-    (should (logx--level-enabled-p 'error 'chatty.lib))))
+    (should (logx--level-enabled-p 'error 'chatty.lib))
+
+    ;; Keyword category matching
+    (logx-set-category-level 'auth 'error)
+    (should-not (logx--level-enabled-p 'info :auth))
+    (should (logx--level-enabled-p 'error :auth))))
 
 (ert-deftest test-logx-macro-zero-cost-disabled-path ()
   "Verify arguments are not evaluated when log level is inactive."

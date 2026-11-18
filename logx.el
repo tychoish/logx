@@ -147,9 +147,22 @@
   "Hook run with one argument (the newly emitted event plist).")
 
 ;;;###autoload
+(defun logx-canonical-level (level)
+  "Resolve LEVEL (symbol, keyword, or string) to a canonical severity symbol."
+  (let* ((sym (cond ((keywordp level) (intern (substring (symbol-name level) 1)))
+                    ((symbolp level) level)
+                    ((stringp level) (intern-soft level))
+                    (t nil)))
+         (aliased (and sym (or (alist-get sym logx--level-aliases) sym))))
+    (and aliased (assq aliased logx--severity-weights) aliased)))
+
+;;;###autoload
 (defun logx-level-weight (level)
   "Return numeric priority for LEVEL symbol, or 0 if unknown."
-  (or (alist-get level logx--severity-weights) 0))
+  (let ((canonical (logx-canonical-level level)))
+    (if canonical
+        (or (alist-get canonical logx--severity-weights) 0)
+      0)))
 
 ;;;###autoload
 (defun logx-set-category-level (category level)
@@ -162,10 +175,16 @@
   "Return non-nil if LEVEL meets or exceeds active threshold for CATEGORY."
   (let* ((weight (logx-level-weight level))
          (cat-thresh (when category
-                       (let ((cat-sym (if (symbolp category)
-                                          category
-                                        (intern-soft (format "%s" category)))))
+                       (let* ((cat-sym (cond ((keywordp category)
+                                              (intern (substring (symbol-name category) 1)))
+                                             ((symbolp category) category)
+                                             ((stringp category) (intern-soft category))
+                                             (t nil)))
+                              (cat-str (if (keywordp category)
+                                           (substring (symbol-name category) 1)
+                                         (format "%s" category))))
                          (or (and cat-sym (map-elt logx-category-levels cat-sym))
+                             (map-elt logx-category-levels cat-str)
                              (map-elt logx-category-levels category)))))
          (threshold (or cat-thresh logx-default-level)))
     (>= weight (logx-level-weight threshold))))
@@ -647,17 +666,15 @@ Returns the number of flushed events."
 ;;; ----------------------------------------------------------------------------
 
 (defun logx--canonical-level (form)
-  "Resolve FORM to a canonical severity symbol, or nil if not a recognized level.
-Supports quoted symbols (e.g. \\='info) and keywords (e.g. :info),
-mapping aliases like `warning' -> `warn' and `trace' -> `debug'."
-  (let* ((sym (cond
-               ((and (consp form) (eq (car form) 'quote) (symbolp (cadr form)))
-                (cadr form))
-               ((keywordp form)
-                (intern (substring (symbol-name form) 1)))
-               (t nil)))
-         (aliased (and sym (or (alist-get sym logx--level-aliases) sym))))
-    (and aliased (assq aliased logx--severity-weights) aliased)))
+  "Resolve FORM in macro args to a canonical severity symbol, or nil if not a level.
+Matches quoted symbols (e.g. \\='info) and keywords (e.g. :info)."
+  (let ((sym (cond
+              ((and (consp form) (eq (car form) 'quote) (symbolp (cadr form)))
+               (cadr form))
+              ((keywordp form)
+               (intern (substring (symbol-name form) 1)))
+              (t nil))))
+    (and sym (logx-canonical-level sym))))
 
 (defun logx--parse-macro-args (args)
   "Extract category, message, and remaining key-values from ARGS.
