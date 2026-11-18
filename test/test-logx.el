@@ -444,5 +444,28 @@
         (logx (setq side-effect-flag t) :extra "val")
         (should-not side-effect-flag)))))
 
+(ert-deftest test-logx-macro-hygiene-and-once-eval ()
+  "Verify macro hygiene (no `lvl' variable capture) and single evaluation of expressions."
+  (let ((logx-default-level 'debug)
+        (logx-default-event-level 'debug)
+        (events nil))
+    (cl-letf (((symbol-function 'logx--ring-push)
+               (lambda (ev) (push ev events) ev)))
+      ;; 1. Variable capture test: user variable named `lvl`
+      (let ((lvl :user-token-value))
+        (logx "Hygiene test" :token lvl)
+        (should (equal (plist-get (plist-get (car events) :data) :token)
+                       :user-token-value)))
+
+      ;; 2. Once-evaluation test: dynamic category form evaluated only once
+      (let ((cat-eval-count 0))
+        (logx-info "Category once eval" :cat (cl-incf cat-eval-count))
+        (should (= cat-eval-count 1)))
+
+      ;; 3. Non-loss of data when both positional string and :msg keyword are given
+      (logx-info "Positional string" :msg "Explicit keyword message")
+      (should (equal (plist-get (car events) :msg) "Positional string"))
+      (should (equal (plist-get (car events) :data) '(:msg "Explicit keyword message"))))))
+
 (provide 'test-logx)
 ;;; test-logx.el ends here

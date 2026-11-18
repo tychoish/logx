@@ -677,8 +677,11 @@ keyword, it is treated as the positional log message."
           (setq cat (cadr args)
                 args (cddr args)))
          ((memq key '(:msg :message))
-          (setq msg (cadr args)
-                args (cddr args)))
+          (if (null msg)
+              (setq msg (cadr args))
+            (push key rest)
+            (push (cadr args) rest))
+          (setq args (cddr args)))
          ((and (null msg) (not (keywordp key)))
           (setq msg key
                 args (cdr args)))
@@ -692,18 +695,56 @@ keyword, it is treated as the positional log message."
     (list :cat cat :msg msg :data (nreverse rest))))
 
 (defun logx--expand-macro (level args macro-sym)
-  "Expand logging macro for LEVEL with ARGS and MACRO-SYM."
+  "Expand logging macro for LEVEL with ARGS and MACRO-SYM.
+When LEVEL is nil, dynamically evaluates `logx-default-event-level' at runtime."
   (let* ((parsed (logx--parse-macro-args args))
          (cat-form (plist-get parsed :cat))
          (msg-form (plist-get parsed :msg))
          (data-forms (plist-get parsed :data))
          (src (logx--capture-call-site macro-sym)))
-    `(when (logx--level-enabled-p ',level ,cat-form)
-       (logx--emit-event ',level
-                         ,cat-form
-                         ,msg-form
-                         ',src
-                         (list ,@data-forms)))))
+    (cond
+     ;; 1. Static compile-time level (zero-cost path)
+     (level
+      (if (and cat-form (not (or (symbolp cat-form) (keywordp cat-form) (stringp cat-form))))
+          (let ((cat-sym (cl-gensym "cat-")))
+            `(let ((,cat-sym ,cat-form))
+               (when (logx--level-enabled-p ',level ,cat-sym)
+                 (logx--emit-event ',level
+                                   ,cat-sym
+                                   ,msg-form
+                                   ',src
+                                   (list ,@data-forms)))))
+        `(when (logx--level-enabled-p ',level ,cat-form)
+           (logx--emit-event ',level
+                             ,cat-form
+                             ,msg-form
+                             ',src
+                             (list ,@data-forms)))))
+
+     ;; 2. Dynamic runtime default level (hygienic gensym bindings)
+     (t
+      (let ((lvl-sym (cl-gensym "lvl-")))
+        (if (and cat-form (not (or (symbolp cat-form) (keywordp cat-form) (stringp cat-form))))
+            (let ((cat-sym (cl-gensym "cat-")))
+              `(let ((,lvl-sym (or (and (boundp 'logx-default-event-level)
+                                        logx-default-event-level)
+                                   'debug))
+                     (,cat-sym ,cat-form))
+                 (when (logx--level-enabled-p ,lvl-sym ,cat-sym)
+                   (logx--emit-event ,lvl-sym
+                                     ,cat-sym
+                                     ,msg-form
+                                     ',src
+                                     (list ,@data-forms)))))
+          `(let ((,lvl-sym (or (and (boundp 'logx-default-event-level)
+                                    logx-default-event-level)
+                               'debug)))
+             (when (logx--level-enabled-p ,lvl-sym ,cat-form)
+               (logx--emit-event ,lvl-sym
+                                 ,cat-form
+                                 ,msg-form
+                                 ',src
+                                 (list ,@data-forms))))))))))
 
 ;;;###autoload
 (defmacro logx (&rest args)
@@ -718,20 +759,7 @@ ARGS can include a positional message string/expression, :cat (or
   (let ((level (logx--canonical-level (car args))))
     (if level
         (logx--expand-macro level (cdr args) 'logx)
-      (let* ((parsed (logx--parse-macro-args args))
-             (cat-form (plist-get parsed :cat))
-             (msg-form (plist-get parsed :msg))
-             (data-forms (plist-get parsed :data))
-             (src (logx--capture-call-site 'logx)))
-        `(let ((lvl (or (and (boundp 'logx-default-event-level)
-                             logx-default-event-level)
-                        'debug)))
-           (when (logx--level-enabled-p lvl ,cat-form)
-             (logx--emit-event lvl
-                               ,cat-form
-                               ,msg-form
-                               ',src
-                               (list ,@data-forms))))))))
+      (logx--expand-macro nil args 'logx))))
 
 ;;;###autoload
 (defmacro logx-debug (&rest args)
