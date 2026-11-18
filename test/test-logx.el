@@ -169,7 +169,22 @@
         (should (= (plist-get parsed :seq) 42))
         (should (equal (plist-get parsed :lvl) "info"))
         (should (equal (plist-get parsed :cat) "agent.asq"))
-        (should (equal (plist-get parsed :msg) "Processing item"))))))
+        (should (equal (plist-get parsed :msg) "Processing item")))))
+
+  ;; List in data and non-string symbol in :msg
+  (let ((event '(:seq 43
+                 :ts 1700000001.0
+                 :lvl warn
+                 :cat test
+                 :msg failed-status
+                 :src nil
+                 :data (:tags ("backend" "auth") :counts (10 20 30)))))
+    (let ((json-str (logx--serialize-jsonl event)))
+      (should (stringp json-str))
+      (let ((parsed (json-parse-string json-str :object-type 'plist)))
+        (should (equal (plist-get parsed :msg) "failed-status"))
+        (should (equal (plist-get (plist-get parsed :data) :tags) ["backend" "auth"]))
+        (should (equal (plist-get (plist-get parsed :data) :counts) [10 20 30]))))))
 
 (ert-deftest test-logx-disk-appender ()
   "Verify log events append to target file."
