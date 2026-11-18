@@ -648,16 +648,13 @@ Returns the number of flushed events."
 
 (defun logx--canonical-level (form)
   "Resolve FORM to a canonical severity symbol, or nil if not a recognized level.
-Supports quoted symbols (e.g. \\='info), unquoted symbols (e.g. info),
-and keywords (e.g. :info), mapping aliases like `warning' -> `warn'
-and `trace' -> `debug'."
+Supports quoted symbols (e.g. \\='info) and keywords (e.g. :info),
+mapping aliases like `warning' -> `warn' and `trace' -> `debug'."
   (let* ((sym (cond
                ((and (consp form) (eq (car form) 'quote) (symbolp (cadr form)))
                 (cadr form))
                ((keywordp form)
                 (intern (substring (symbol-name form) 1)))
-               ((symbolp form)
-                form)
                (t nil)))
          (aliased (and sym (or (alist-get sym logx--level-aliases) sym))))
     (and aliased (assq aliased logx--severity-weights) aliased)))

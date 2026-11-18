@@ -377,12 +377,15 @@
       (should (eq (plist-get (car events) :lvl) 'debug))
       (should (equal (plist-get (car events) :msg) "Trace message"))
 
-      ;; 3. Bare symbol and keyword levels
-      (logx info "Bare symbol info")
-      (should (eq (plist-get (car events) :lvl) 'info))
-
+      ;; 3. Keyword levels and variable preservation
       (logx :warn "Keyword warn")
       (should (eq (plist-get (car events) :lvl) 'warn))
+
+      ;; User variable named after a level is treated as message, not level
+      (let ((info "Message from info variable"))
+        (logx info)
+        (should (eq (plist-get (car events) :lvl) 'debug))
+        (should (equal (plist-get (car events) :msg) "Message from info variable")))
 
       ;; 4. Default level when omitted
       (logx "Untagged message" :count 5)
