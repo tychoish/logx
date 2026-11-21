@@ -681,12 +681,14 @@ and keywords (e.g. :info)."
     (and sym (logx-canonical-level sym))))
 
 (defun logx--parse-macro-args (args)
-  "Extract category, message, and remaining key-values from ARGS.
+  "Extract category, message, source, and remaining key-values from ARGS.
 Supports :cat, :category, and :domain for category; :msg and :message
-for message. If a non-keyword argument is encountered before a message
-keyword, it is treated as the positional log message."
+for message; :src, :source, and :caller for source coordinates.
+If a non-keyword argument is encountered before a message keyword,
+it is treated as the positional log message."
   (let ((cat nil)
         (msg nil)
+        (src nil)
         (rest nil))
     (while args
       (let ((key (car args)))
@@ -700,6 +702,9 @@ keyword, it is treated as the positional log message."
             (push key rest)
             (push (cadr args) rest))
           (setq args (cddr args)))
+         ((memq key '(:src :source :caller))
+          (setq src (cadr args)
+                args (cddr args)))
          ((and (null msg) (not (keywordp key)))
           (setq msg key
                 args (cdr args)))
@@ -710,7 +715,7 @@ keyword, it is treated as the positional log message."
          (t
           (push key rest)
           (setq args (cdr args))))))
-    (list :cat cat :msg msg :data (nreverse rest))))
+    (list :cat cat :msg msg :src src :data (nreverse rest))))
 
 (defun logx--expand-macro (level args macro-sym)
   "Expand logging macro for LEVEL with ARGS and MACRO-SYM.
@@ -718,30 +723,53 @@ When LEVEL is nil, dynamically evaluates `logx-default-event-level' at runtime."
   (let* ((parsed (logx--parse-macro-args args))
          (cat-form (plist-get parsed :cat))
          (msg-form (plist-get parsed :msg))
+         (src-form (plist-get parsed :src))
          (data-forms (plist-get parsed :data))
          (src (logx--capture-call-site macro-sym)))
     (cond
      ;; 1. Static compile-time level (zero-cost path)
      (level
-      (if (and cat-form (not (or (symbolp cat-form) (keywordp cat-form) (stringp cat-form))))
-          (let ((cat-sym (gensym "cat-")))
-            `(let ((,cat-sym ,cat-form))
-               (when (logx--level-enabled-p ',level ,cat-sym)
-                 (logx--emit-event ',level
-                                   ,cat-sym
-                                   ,msg-form
-                                   ',src
-                                   (list ,@data-forms)))))
-        `(when (logx--level-enabled-p ',level ,cat-form)
-           (logx--emit-event ',level
-                             ,cat-form
-                             ,msg-form
-                             ',src
-                             (list ,@data-forms)))))
+      (let ((body-fn
+             (lambda (cat-expr)
+               (if src-form
+                   (let ((src-sym (gensym "src-")))
+                     `(let ((,src-sym (or ,src-form ',src)))
+                        (logx--emit-event ',level
+                                          ,cat-expr
+                                          ,msg-form
+                                          ,src-sym
+                                          (list ,@data-forms))))
+                 `(logx--emit-event ',level
+                                    ,cat-expr
+                                    ,msg-form
+                                    ',src
+                                    (list ,@data-forms))))))
+        (if (and cat-form (not (or (symbolp cat-form) (keywordp cat-form) (stringp cat-form))))
+            (let ((cat-sym (gensym "cat-")))
+              `(let ((,cat-sym ,cat-form))
+                 (when (logx--level-enabled-p ',level ,cat-sym)
+                   ,(funcall body-fn cat-sym))))
+          `(when (logx--level-enabled-p ',level ,cat-form)
+             ,(funcall body-fn cat-form)))))
 
      ;; 2. Dynamic runtime default level (hygienic gensym bindings)
      (t
-      (let ((lvl-sym (gensym "lvl-")))
+      (let* ((lvl-sym (gensym "lvl-"))
+             (body-fn
+              (lambda (cat-expr)
+                (if src-form
+                    (let ((src-sym (gensym "src-")))
+                      `(let ((,src-sym (or ,src-form ',src)))
+                         (logx--emit-event ,lvl-sym
+                                           ,cat-expr
+                                           ,msg-form
+                                           ,src-sym
+                                           (list ,@data-forms))))
+                  `(logx--emit-event ,lvl-sym
+                                     ,cat-expr
+                                     ,msg-form
+                                     ',src
+                                     (list ,@data-forms))))))
         (if (and cat-form (not (or (symbolp cat-form) (keywordp cat-form) (stringp cat-form))))
             (let ((cat-sym (gensym "cat-")))
               `(let ((,lvl-sym (or (and (boundp 'logx-default-event-level)
@@ -749,20 +777,12 @@ When LEVEL is nil, dynamically evaluates `logx-default-event-level' at runtime."
                                    'debug))
                      (,cat-sym ,cat-form))
                  (when (logx--level-enabled-p ,lvl-sym ,cat-sym)
-                   (logx--emit-event ,lvl-sym
-                                     ,cat-sym
-                                     ,msg-form
-                                     ',src
-                                     (list ,@data-forms)))))
+                   ,(funcall body-fn cat-sym))))
           `(let ((,lvl-sym (or (and (boundp 'logx-default-event-level)
                                     logx-default-event-level)
                                'debug)))
              (when (logx--level-enabled-p ,lvl-sym ,cat-form)
-               (logx--emit-event ,lvl-sym
-                                 ,cat-form
-                                 ,msg-form
-                                 ',src
-                                 (list ,@data-forms))))))))))
+               ,(funcall body-fn cat-form)))))))))
 
 ;;;###autoload
 (defmacro logx (&rest args)

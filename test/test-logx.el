@@ -505,5 +505,17 @@
     (let ((site (logx--capture-call-site 'logx-info)))
       (should (eq (plist-get site :fn) 'my-other-function)))))
 
+(ert-deftest test-logx-explicit-src-override ()
+  "Verify passing explicit :src overrides macro-expansion call site."
+  (let ((custom-src '(:file "custom-tool.el" :line 88 :fn my-custom-tool))
+        (received nil))
+    (logx-register-subscriber 'src-test-sub (lambda (ev) (push ev received)))
+    (unwind-protect
+        (progn
+          (logx-info :cat 'test-tool :msg "Custom origin" :src custom-src)
+          (should received)
+          (should (equal (plist-get (car received) :src) custom-src)))
+      (logx-unregister-subscriber 'src-test-sub))))
+
 (provide 'test-logx)
 ;;; test-logx.el ends here
