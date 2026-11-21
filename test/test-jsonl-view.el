@@ -106,16 +106,66 @@
     (jsonl-view-toggle-disclosure)
     ;; Filter to show only admin
     (jsonl-view-filter (lambda (rec) (equal (plist-get rec :role) "admin")))
-    ;; Guest line and its expansion line must be hidden
+    ;; Guest line and all its expansion lines must be hidden
     (save-excursion
       (goto-char (point-min))
       (should (eq (get-text-property (point) 'invisible) 'jsonl-filter-hidden))
       (forward-line 1)
-      ;; Expansion line must also be hidden
-      (should (eq (get-text-property (point) 'invisible) 'jsonl-filter-hidden))
-      (forward-line 1)
+      (while (get-text-property (point) 'jsonl-expansion)
+        (should (eq (get-text-property (point) 'invisible) 'jsonl-filter-hidden))
+        (forward-line 1))
       ;; Admin line must be visible
       (should-not (get-text-property (point) 'invisible)))))
+
+(ert-deftest test-jsonl-view-omit-nil-fields ()
+  "Verify default formatter omits fields with nil or :null values."
+  (let* ((rec '(:id 10 :name "test" :missing nil :none :null :extra "present"))
+         (rendered (jsonl-view-default-formatter rec)))
+    (should (string-match-p "id: 10" rendered))
+    (should (string-match-p "name: test" rendered))
+    (should (string-match-p "extra: present" rendered))
+    (should-not (string-match-p "missing" rendered))
+    (should-not (string-match-p "none" rendered))))
+
+(ert-deftest test-jsonl-view-disclosure-arrow-not-underlined ()
+  "Verify disclosure button face specifies :underline nil."
+  (should-not (face-attribute 'jsonl-view-disclosure-button :underline)))
+
+(ert-deftest test-jsonl-view-expansion-styles ()
+  "Verify 4 payload expansion styles: json-multiline, json-oneline, sexp-multiline, sexp-oneline."
+  (let ((val '(:method "tools/call" :params (:name "my_tool" :arguments (:x 1)))))
+    ;; 1. json-multiline (pretty formatted across multiple lines)
+    (let ((fmt (jsonl-view--format-expansion val 'json-multiline)))
+      (should (> (length (split-string fmt "\n")) 1))
+      (should (string-match-p "\"method\": \"tools/call\"" fmt)))
+
+    ;; 2. json-oneline (compact single line JSON)
+    (let ((fmt (jsonl-view--format-expansion val 'json-oneline)))
+      (should (= (length (split-string fmt "\n")) 1))
+      (should (string-match-p "\"method\":\"tools/call\"" fmt)))
+
+    ;; 3. sexp-multiline (pretty formatted across multiple lines)
+    (let ((fmt (jsonl-view--format-expansion val 'sexp-multiline)))
+      (should (> (length (split-string fmt "\n")) 1))
+      (should (string-match-p ":method \"tools/call\"" fmt)))
+
+    ;; 4. sexp-oneline (compact single line sexp)
+    (let ((fmt (jsonl-view--format-expansion val 'sexp-oneline)))
+      (should (= (length (split-string fmt "\n")) 1))
+      (should (string-match-p ":method \"tools/call\"" fmt))))
+
+  ;; Verify style cycling and buffer-local setters
+  (with-temp-buffer
+    (jsonl-view-mode)
+    (should (eq jsonl-view-expansion-style 'json-multiline))
+    (jsonl-view-set-style-json-oneline)
+    (should (eq jsonl-view-expansion-style 'json-oneline))
+    (jsonl-view-set-style-sexp-multiline)
+    (should (eq jsonl-view-expansion-style 'sexp-multiline))
+    (jsonl-view-set-style-sexp-oneline)
+    (should (eq jsonl-view-expansion-style 'sexp-oneline))
+    (jsonl-view-cycle-expansion-style)
+    (should (eq jsonl-view-expansion-style 'json-multiline))))
 
 (provide 'test-jsonl-view)
 ;;; test-jsonl-view.el ends here

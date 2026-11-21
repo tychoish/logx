@@ -30,6 +30,8 @@
 (require 'map)
 (require 'json)
 (require 'button)
+(require 'transient)
+(require 'pp)
 
 (defgroup jsonl-view nil
   "General-purpose line-oriented JSON viewer."
@@ -70,13 +72,29 @@ Accepts (RECORD &optional PREV-RECORD) and returns a propertized string.")
   :group 'jsonl-view)
 
 (defface jsonl-view-disclosure-button
-  '((default :inherit button))
+  '((default :inherit button :underline nil))
   "Face for inline disclosure expansion widgets."
+  :group 'jsonl-view)
+
+(defcustom jsonl-view-expansion-style 'json-multiline
+  "Default expansion style for payload disclosures in `jsonl-view' and `logx-view'.
+Options are:
+- `json-multiline': Formatted multi-line indented JSON (pretty-printed)
+- `json-oneline': Compact single-line JSON
+- `sexp-multiline': Formatted multi-line indented Emacs Lisp s-expression
+- `sexp-oneline': Compact single-line Emacs Lisp s-expression"
+  :type '(choice (const :tag "JSON (multi-line pretty)" json-multiline)
+                 (const :tag "JSON (one-line compact)" json-oneline)
+                 (const :tag "S-expression (multi-line pretty)" sexp-multiline)
+                 (const :tag "S-expression (one-line compact)" sexp-oneline))
   :group 'jsonl-view)
 
 ;;; ----------------------------------------------------------------------------
 ;;; Buffer-Local State
 ;;; ----------------------------------------------------------------------------
+
+(defvar-local jsonl-view-expansion-style 'json-multiline
+  "Per-buffer payload disclosure expansion style.")
 
 (defvar-local jsonl-view-follow-mode nil
   "Non-nil if the viewer buffer automatically scrolls to the end on new lines.")
@@ -103,39 +121,41 @@ Returns nil if LINE-STR is blank or unparseable."
 
 ;;;###autoload
 (defun jsonl-view-default-formatter (record &optional _prev-record)
-  "Render generic JSON RECORD plist into a one-line summary string."
+  "Render generic JSON RECORD plist into a one-line summary string.
+Fields with nil or :null values are omitted."
   (with-temp-buffer
     (let ((tail record)
           (first t))
       (while tail
         (let* ((k (car tail))
-               (v (cadr tail))
-               (k-name (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k)))
-               (v-str (format "%s" v)))
-          (unless first (insert "  "))
-          (setq first nil)
-          (insert (propertize (format "%s:" k-name) 'face 'jsonl-view-key) " ")
-          (if (or (consp v) (hash-table-p v))
-              (insert-text-button "▶"
-                                  'action #'jsonl-view--toggle-disclosure-action
-                                  'jsonl-value v
-                                  'jsonl-expanded nil
-                                  'face 'jsonl-view-disclosure-button
-                                  'help-echo "mouse-1, RET: expand payload"
-                                  'follow-link t)
-            (if (> (length v-str) jsonl-view-truncate-length)
-                (progn
-                  (insert (propertize (substring v-str 0 jsonl-view-truncate-length)
-                                      'face 'jsonl-view-string))
-                  (insert " ")
-                  (insert-text-button "…"
+               (v (cadr tail)))
+          (unless (or (null v) (eq v :null))
+            (let* ((k-name (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k)))
+                   (v-str (format "%s" v)))
+              (unless first (insert "  "))
+              (setq first nil)
+              (insert (propertize (format "%s:" k-name) 'face 'jsonl-view-key) " ")
+              (if (or (consp v) (hash-table-p v))
+                  (insert-text-button "▶"
                                       'action #'jsonl-view--toggle-disclosure-action
                                       'jsonl-value v
                                       'jsonl-expanded nil
                                       'face 'jsonl-view-disclosure-button
-                                      'help-echo "mouse-1, RET: expand full text"
-                                      'follow-link t))
-              (insert (propertize v-str 'face (if (numberp v) 'jsonl-view-number 'jsonl-view-string))))))
+                                      'help-echo "mouse-1, RET: expand payload"
+                                      'follow-link t)
+                (if (> (length v-str) jsonl-view-truncate-length)
+                    (progn
+                      (insert (propertize (substring v-str 0 jsonl-view-truncate-length)
+                                          'face 'jsonl-view-string))
+                      (insert " ")
+                      (insert-text-button "…"
+                                          'action #'jsonl-view--toggle-disclosure-action
+                                          'jsonl-value v
+                                          'jsonl-expanded nil
+                                          'face 'jsonl-view-disclosure-button
+                                          'help-echo "mouse-1, RET: expand full text"
+                                          'follow-link t))
+                  (insert (propertize v-str 'face (if (numberp v) 'jsonl-view-number 'jsonl-view-string))))))))
         (setq tail (cddr tail)))
       (insert "\n")
       (propertize (buffer-string)
@@ -144,6 +164,75 @@ Returns nil if LINE-STR is blank or unparseable."
 ;;; ----------------------------------------------------------------------------
 ;;; In-Place Disclosure Engine
 ;;; ----------------------------------------------------------------------------
+
+(defun jsonl-view--format-sexp-multiline (obj)
+  "Format OBJ as a multi-line indented S-expression."
+  (cond
+   ((and (listp obj) (keywordp (car obj)))
+    (let ((lines nil)
+          (tail obj))
+      (while tail
+        (let ((k (car tail))
+              (v (cadr tail)))
+          (push (format "  %s %s" k
+                        (cond
+                         ((and (listp v) (keywordp (car v)))
+                          (string-trim (jsonl-view--format-sexp-multiline v)))
+                         (t (format "%S" v))))
+                lines)
+          (setq tail (cddr tail))))
+      (format "(\n%s)" (string-join (nreverse lines) "\n"))))
+   ((hash-table-p obj)
+    (let ((items nil))
+      (map-do (lambda (k v) (push (format "  :%s %S" k v) items)) obj)
+      (format "#<hash-table (\n%s)>" (string-join (nreverse items) "\n"))))
+   (t
+    (string-trim-right (pp-to-string obj)))))
+
+(defun jsonl-view--format-expansion (val style)
+  "Format VAL for inline expansion according to STYLE.
+STYLE is one of `json-multiline', `json-oneline', `sexp-multiline',
+or `sexp-oneline'."
+  (let* ((parsed-val (if (stringp val)
+                         (condition-case nil
+                             (let ((trimmed (string-trim val)))
+                               (if (or (string-prefix-p "{" trimmed)
+                                       (string-prefix-p "[" trimmed))
+                                   (json-parse-string trimmed :object-type 'plist)
+                                 nil))
+                           (error nil))
+                       nil))
+         (obj (or parsed-val val)))
+    (pcase style
+      ('json-multiline
+       (condition-case nil
+           (with-temp-buffer
+             (insert (json-serialize obj))
+             (json-pretty-print (point-min) (point-max))
+             (string-trim-right (buffer-string)))
+         (error (if (stringp val) val (format "%S" val)))))
+      ('json-oneline
+       (condition-case nil
+           (json-serialize obj)
+         (error (if (stringp val) val (format "%S" val)))))
+      ('sexp-multiline
+       (jsonl-view--format-sexp-multiline obj))
+      ('sexp-oneline
+       (format "%S" obj))
+      (_
+       (condition-case nil
+           (with-temp-buffer
+             (insert (json-serialize obj))
+             (json-pretty-print (point-min) (point-max))
+             (string-trim-right (buffer-string)))
+         (error (format "%S" obj)))))))
+
+(defun jsonl-view--indent-expansion-text (text &optional indent)
+  "Indent each line of TEXT with INDENT spaces (default 4)."
+  (let ((spaces (make-string (or indent 4) ?\s)))
+    (string-join (mapcar (lambda (line) (concat spaces line))
+                         (split-string text "\n"))
+                 "\n")))
 
 (defun jsonl-view--toggle-disclosure-action (btn)
   "Toggle disclosure state for disclosure button BTN."
@@ -179,12 +268,106 @@ Returns nil if LINE-STR is blank or unparseable."
                               'help-echo "mouse-1, RET: collapse payload"
                               'follow-link t))
         (goto-char (line-end-position))
-        (let ((formatted-json (condition-case nil
-                                  (json-serialize full-val)
-                                (error (format "%S" full-val)))))
-          (insert (propertize (format "\n    %s" formatted-json)
+        (let* ((formatted (jsonl-view--format-expansion full-val jsonl-view-expansion-style))
+               (indented (jsonl-view--indent-expansion-text formatted 4)))
+          (insert (propertize (format "\n%s" indented)
                               'jsonl-expansion t
                               'face 'font-lock-doc-face)))))))
+
+(defun jsonl-view--current-line-disclosure-button ()
+  "Return disclosure button on current line, or nil."
+  (save-excursion
+    (beginning-of-line)
+    (let ((found nil)
+          (eol (line-end-position)))
+      (while (and (< (point) eol) (not found))
+        (let ((b (button-at (point))))
+          (if (and b (button-get b 'jsonl-value))
+              (setq found b)
+            (forward-char 1))))
+      found)))
+
+(defun jsonl-view--reexpand-current ()
+  "Re-expand disclosure on current line if already expanded."
+  (let ((btn (jsonl-view--current-line-disclosure-button)))
+    (when (and btn (button-get btn 'jsonl-expanded))
+      (jsonl-view--toggle-disclosure-action btn)
+      (when-let* ((new-btn (jsonl-view--current-line-disclosure-button)))
+        (jsonl-view--toggle-disclosure-action new-btn)))))
+
+;;;###autoload
+(defun jsonl-view-set-style-json-multiline ()
+  "Set payload expansion style to multi-line pretty-printed JSON."
+  (interactive)
+  (setq-local jsonl-view-expansion-style 'json-multiline)
+  (jsonl-view--reexpand-current)
+  (message "Payload expansion style: JSON (multi-line pretty)"))
+
+;;;###autoload
+(defun jsonl-view-set-style-json-oneline ()
+  "Set payload expansion style to one-line compact JSON."
+  (interactive)
+  (setq-local jsonl-view-expansion-style 'json-oneline)
+  (jsonl-view--reexpand-current)
+  (message "Payload expansion style: JSON (one-line compact)"))
+
+;;;###autoload
+(defun jsonl-view-set-style-sexp-multiline ()
+  "Set payload expansion style to multi-line pretty-printed S-expression."
+  (interactive)
+  (setq-local jsonl-view-expansion-style 'sexp-multiline)
+  (jsonl-view--reexpand-current)
+  (message "Payload expansion style: S-expression (multi-line pretty)"))
+
+;;;###autoload
+(defun jsonl-view-set-style-sexp-oneline ()
+  "Set payload expansion style to one-line compact S-expression."
+  (interactive)
+  (setq-local jsonl-view-expansion-style 'sexp-oneline)
+  (jsonl-view--reexpand-current)
+  (message "Payload expansion style: S-expression (one-line compact)"))
+
+;;;###autoload
+(defun jsonl-view-cycle-expansion-style ()
+  "Cycle payload expansion style through the 4 available styles."
+  (interactive)
+  (setq-local jsonl-view-expansion-style
+              (pcase jsonl-view-expansion-style
+                ('json-multiline 'json-oneline)
+                ('json-oneline   'sexp-multiline)
+                ('sexp-multiline 'sexp-oneline)
+                (_               'json-multiline)))
+  (jsonl-view--reexpand-current)
+  (message "Payload expansion style: %s"
+           (pcase jsonl-view-expansion-style
+             ('json-multiline "JSON (multi-line pretty)")
+             ('json-oneline "JSON (one-line compact)")
+             ('sexp-multiline "S-expression (multi-line pretty)")
+             ('sexp-oneline "S-expression (one-line compact)"))))
+
+;;;###autoload
+(defun jsonl-view-set-expansion-style (style)
+  "Select payload expansion STYLE from the 4 available options."
+  (interactive
+   (list (intern (completing-read "Expansion style: "
+                                  '("json-multiline" "json-oneline" "sexp-multiline" "sexp-oneline")
+                                  nil t nil nil "json-multiline"))))
+  (setq-local jsonl-view-expansion-style style)
+  (jsonl-view--reexpand-current)
+  (message "Payload expansion style: %s" style))
+
+;;;###autoload
+(transient-define-prefix jsonl-view-expansion-menu ()
+  "Configure payload disclosure expansion style for current buffer."
+  [:description (lambda () (format "Payload Expansion Style (current: %s)" jsonl-view-expansion-style))
+   ["Format Options"
+    ("j" "JSON (multi-line pretty)" jsonl-view-set-style-json-multiline)
+    ("J" "JSON (one-line compact)"  jsonl-view-set-style-json-oneline)
+    ("s" "Sexp (multi-line pretty)" jsonl-view-set-style-sexp-multiline)
+    ("S" "Sexp (one-line compact)"  jsonl-view-set-style-sexp-oneline)]
+   ["Actions"
+    ("c" "Cycle next style"         jsonl-view-cycle-expansion-style)
+    ("q" "Quit"                     transient-quit-one)]])
 
 ;;;###autoload
 (defun jsonl-view-toggle-disclosure ()
@@ -352,6 +535,8 @@ Returns nil if LINE-STR is blank or unparseable."
     (define-key map (kbd "<tab>")     #'jsonl-view-toggle-disclosure)
     (define-key map (kbd "<backtab>") #'jsonl-view-collapse-all)
     (define-key map (kbd "S-TAB")     #'jsonl-view-collapse-all)
+    (define-key map (kbd "e")         #'jsonl-view-expansion-menu)
+    (define-key map (kbd "E")         #'jsonl-view-cycle-expansion-style)
     (define-key map (kbd "i")         #'jsonl-view-toggle-info)
     (define-key map (kbd "w")         #'jsonl-view-copy-as-json)
     (define-key map (kbd "F")         #'jsonl-view-toggle-follow)

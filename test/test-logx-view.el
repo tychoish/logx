@@ -207,5 +207,67 @@
               (should-not (string-match-p "FS error" content))))
         (kill-buffer forked-buf)))))
 
+(ert-deftest test-logx-view-omit-nil-fields ()
+  "Verify nil and :null fields are omitted from projected data and rendered output."
+  (let* ((rec '(:seq 5012 :ts 100.0 :lvl info :cat root :msg "hello"
+                :src (:file "test.el" :line 10) :data nil :extra_nil nil :other :null :valid 42))
+         (proj (logx-view-project-record rec))
+         (rendered (logx-view-render-record rec)))
+    ;; In projection, data should only contain non-nil fields
+    (should (equal (plist-get proj :data) '(:seq 5012 :valid 42)))
+    ;; Rendered text should not contain "data: nil" or "extra_nil:" or "other:"
+    (should-not (string-match-p "data: nil" rendered))
+    (should-not (string-match-p "extra_nil" rendered))
+    (should-not (string-match-p "other" rendered))
+    (should (string-match-p "seq: 5012" rendered))
+    (should (string-match-p "valid: 42" rendered))))
+
+(ert-deftest test-logx-view-source-whitespace-not-underlined ()
+  "Verify whitespace before source button is not part of the button."
+  (let* ((rec '(:seq 1 :ts 100.0 :lvl info :cat root :msg "hi" :src (:file "test.el" :line 10)))
+         (rendered (logx-view-render-record rec))
+         (src-pos (string-match "test\\.el:10" rendered)))
+    (should src-pos)
+    ;; The character right before the button is a space and should NOT have the button property or link face
+    (let ((space-pos (1- src-pos)))
+      (should-not (get-text-property space-pos 'button rendered))
+      (should-not (eq (get-text-property space-pos 'face rendered) 'logx-view-source-link)))))
+
+(ert-deftest test-logx-view-background-buffer-flush ()
+  "Verify events are delivered to active viewer buffers even when not visible in a window."
+  (let ((buf (get-buffer-create "*test-logx-view-bg*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (logx-view-mode))
+          (logx-view-register-viewer buf)
+          ;; Ensure buffer has no visible window
+          (should-not (get-buffer-window buf 'visible))
+          ;; Push event
+          (logx--emit-event 'info 'bg "Background message" nil '(:val 99))
+          ;; Flush
+          (logx-view--flush-active-viewers)
+          ;; Buffer should contain the rendered event
+          (with-current-buffer buf
+            (should (string-match-p "Background message" (buffer-string)))
+            (should (string-match-p "data:" (buffer-string)))))
+      (kill-buffer buf))))
+
+(ert-deftest test-logx-view-refresh ()
+  "Verify logx-view-refresh restores ring buffer contents."
+  (let ((buf (get-buffer-create "*test-logx-refresh*"))
+        (logx--ring (make-ring 10)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (logx-view-mode))
+          (logx--ring-push '(:seq 1 :lvl info :cat "r" :msg "Msg 1"))
+          (logx--ring-push '(:seq 2 :lvl info :cat "r" :msg "Msg 2"))
+          (with-current-buffer buf
+            (logx-view-refresh)
+            (should (string-match-p "Msg 1" (buffer-string)))
+            (should (string-match-p "Msg 2" (buffer-string)))))
+      (kill-buffer buf))))
+
 (provide 'test-logx-view)
 ;;; test-logx-view.el ends here

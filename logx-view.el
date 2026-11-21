@@ -188,7 +188,9 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
                       (member (downcase k-str) lvl-cand)
                       (member (downcase k-str) cat-cand)
                       (member (downcase k-str) msg-cand)
-                      (member (downcase k-str) src-cand))
+                      (member (downcase k-str) src-cand)
+                      (null v)
+                      (eq v :null))
             (push k data)
             (push v data)))
         (setq tail (cddr tail)))
@@ -289,39 +291,40 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
       (let ((tail data))
         (while tail
           (let* ((k (car tail))
-                 (v (cadr tail))
-                 (k-name (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k)))
-                 (v-str (format "%s" v)))
-            (insert "  " (propertize (format "%s:" k-name) 'face 'logx-view-key) " ")
-            (if (or (consp v) (hash-table-p v))
-                (insert-text-button "▶"
-                                    'action #'jsonl-view--toggle-disclosure-action
-                                    'jsonl-value v
-                                    'jsonl-expanded nil
-                                    'face 'jsonl-view-disclosure-button
-                                    'help-echo "mouse-1, RET: expand payload"
-                                    'follow-link t)
-              (if (> (length v-str) jsonl-view-truncate-length)
-                  (progn
-                    (insert (propertize (substring v-str 0 jsonl-view-truncate-length)
-                                        'face 'font-lock-string-face))
-                    (insert " ")
-                    (insert-text-button "…"
+                 (v (cadr tail)))
+            (unless (or (null v) (eq v :null))
+              (let* ((k-name (if (keywordp k) (substring (symbol-name k) 1) (format "%s" k)))
+                     (v-str (format "%s" v)))
+                (insert "  " (propertize (format "%s:" k-name) 'face 'logx-view-key) " ")
+                (if (or (consp v) (hash-table-p v))
+                    (insert-text-button "▶"
                                         'action #'jsonl-view--toggle-disclosure-action
                                         'jsonl-value v
                                         'jsonl-expanded nil
                                         'face 'jsonl-view-disclosure-button
-                                        'help-echo "mouse-1, RET: expand full text"
-                                        'follow-link t))
-                (insert (propertize v-str 'face (if (numberp v) 'font-lock-constant-face 'font-lock-string-face))))))
+                                        'help-echo "mouse-1, RET: expand payload"
+                                        'follow-link t)
+                  (if (> (length v-str) jsonl-view-truncate-length)
+                      (progn
+                        (insert (propertize (substring v-str 0 jsonl-view-truncate-length)
+                                            'face 'font-lock-string-face))
+                        (insert " ")
+                        (insert-text-button "…"
+                                            'action #'jsonl-view--toggle-disclosure-action
+                                            'jsonl-value v
+                                            'jsonl-expanded nil
+                                            'face 'jsonl-view-disclosure-button
+                                            'help-echo "mouse-1, RET: expand full text"
+                                            'follow-link t))
+                    (insert (propertize v-str 'face (if (numberp v) 'font-lock-constant-face 'font-lock-string-face))))))))
           (setq tail (cddr tail))))
       ;; Source hyperlink
       (when src
         (let* ((file (or (plist-get src :file)
                          (and (plist-get src :path) (file-name-nondirectory (plist-get src :path)))))
                (line (plist-get src :line))
-               (label (if (and file line) (format " %s:%s" file line) " [src]")))
-          (insert "  ")
+               (label (if (and file line) (format "%s:%s" file line) "[src]")))
+          (insert "   ")
           (insert-text-button label
                               'action #'logx-view--source-jump-action
                               'logx-source src
@@ -474,7 +477,7 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
   (logx-view-unregister-viewer (current-buffer)))
 
 (defun logx-view--flush-active-viewers ()
-  "Flush pending events to all visible subscriber viewer buffers in batches."
+  "Flush pending events to all active viewer buffers in batches."
   (setq logx-view--flush-timer nil)
   (when logx-view--pending-events
     (let ((events (nreverse logx-view--pending-events)))
@@ -485,11 +488,10 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
       (dolist (entry logx-view--active-viewers)
         (let ((buf (car entry))
               (pred (cdr entry)))
-          (when (and (buffer-live-p buf)
-                     (get-buffer-window buf 'visible))
+          (when (buffer-live-p buf)
             (with-current-buffer buf
               (let ((inhibit-read-only t)
-                    (orig-window (get-buffer-window buf))
+                    (orig-window (get-buffer-window buf 'visible))
                     (should-follow jsonl-view-follow-mode))
                 (save-excursion
                   (goto-char (point-max))
@@ -501,8 +503,10 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
                       (goto-char (point-min))
                       (forward-line excess)
                       (delete-region (point-min) (point)))))
-                (when (and should-follow orig-window)
-                  (with-selected-window orig-window
+                (when should-follow
+                  (if orig-window
+                      (with-selected-window orig-window
+                        (goto-char (point-max)))
                     (goto-char (point-max))))))))))))
 
 (defun logx-view--schedule-flush ()
@@ -563,6 +567,20 @@ Creates *logs:NAME* containing events matching FILTER-PRED."
     (logx-view-register-viewer buf filter-pred)
     (pop-to-buffer buf)))
 
+;;;###autoload
+(defun logx-view-refresh (&optional _ignore-auto _noconfirm)
+  "Refresh `logx-view' buffer from the in-memory ring buffer."
+  (interactive)
+  (let ((inhibit-read-only t)
+        (pred (or (alist-get (current-buffer) logx-view--active-viewers)
+                  (lambda (_ev) t))))
+    (erase-buffer)
+    (dolist (ev (logx--ring-to-list))
+      (when (funcall pred ev)
+        (insert (logx-view-render-record ev))))
+    (when jsonl-view-follow-mode
+      (goto-char (point-max)))))
+
 ;;; ----------------------------------------------------------------------------
 ;;; Major Mode & Keymap
 ;;; ----------------------------------------------------------------------------
@@ -576,6 +594,7 @@ Creates *logs:NAME* containing events matching FILTER-PRED."
     (define-key map (kbd "c")       #'logx-view-filter-category)
     (define-key map (kbd "C")       #'logx-view-clear-filters)
     (define-key map (kbd "B")       #'logx-fork-filtered-buffer)
+    (define-key map (kbd "g")       #'revert-buffer)
     map)
   "Keymap for `logx-view-mode'.")
 
@@ -584,6 +603,7 @@ Creates *logs:NAME* containing events matching FILTER-PRED."
   "Major mode for viewing live and persisted logx event streams."
   :group 'logx-view
   (setq-local jsonl-view-formatter-function #'logx-view-render-record)
+  (setq-local revert-buffer-function #'logx-view-refresh)
   (add-hook 'kill-buffer-hook #'logx-view--on-kill-buffer nil t))
 
 (provide 'logx-view)
