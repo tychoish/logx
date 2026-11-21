@@ -241,12 +241,21 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
   (let ((src (button-get btn 'logx-source)))
     (when src
       (let ((path (or (plist-get src :path) (plist-get src :file)))
-            (line (plist-get src :line)))
-        (when path
-          (find-file-other-window path)
-          (when (and line (numberp line))
-            (goto-char (point-min))
-            (forward-line (1- line))))))))
+            (line (plist-get src :line))
+            (fn (plist-get src :fn)))
+        (if path
+            (progn
+              (find-file-other-window path)
+              (cond
+               ((and line (numberp line) (> line 0))
+                (goto-char (point-min))
+                (forward-line (1- line)))
+               (fn
+                (goto-char (point-min))
+                (or (re-search-forward (format "(\\(?:def[a-z*]+\\|cl-def[a-z*]+\\)\\s-+%s\\_>" (regexp-quote (symbol-name fn))) nil t)
+                    (re-search-forward (regexp-quote (symbol-name fn)) nil t)))))
+          (when fn
+            (find-function fn)))))))
 
 ;;;###autoload
 (defun logx-view-jump-to-source ()
@@ -255,14 +264,22 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
   (let ((src (get-text-property (point) 'logx-source)))
     (if src
         (let ((path (or (plist-get src :path) (plist-get src :file)))
-              (line (plist-get src :line)))
+              (line (plist-get src :line))
+              (fn (plist-get src :fn)))
           (if path
               (progn
                 (find-file-other-window path)
-                (when (and line (numberp line))
+                (cond
+                 ((and line (numberp line) (> line 0))
                   (goto-char (point-min))
-                  (forward-line (1- line))))
-            (message "Source file path not available.")))
+                  (forward-line (1- line)))
+                 (fn
+                  (goto-char (point-min))
+                  (or (re-search-forward (format "(\\(?:def[a-z*]+\\|cl-def[a-z*]+\\)\\s-+%s\\_>" (regexp-quote (symbol-name fn))) nil t)
+                      (re-search-forward (regexp-quote (symbol-name fn)) nil t)))))
+            (if fn
+                (find-function fn)
+              (message "Source file path not available."))))
       (message "No source call-site metadata for record at point."))))
 
 ;;;###autoload
@@ -323,7 +340,13 @@ Returns a plist (:ts TS :lvl LVL :cat CAT :msg MSG :src SRC :data DATA)."
         (let* ((file (or (plist-get src :file)
                          (and (plist-get src :path) (file-name-nondirectory (plist-get src :path)))))
                (line (plist-get src :line))
-               (label (if (and file line) (format "%s:%s" file line) "[src]")))
+               (fn (plist-get src :fn))
+               (label (cond
+                       ((and file line (numberp line) (> line 0)) (format "%s:%s" file line))
+                       ((and file fn) (format "%s:%s" file fn))
+                       (file file)
+                       (fn (format "%s" fn))
+                       (t "[src]"))))
           (insert "   ")
           (insert-text-button label
                               'action #'logx-view--source-jump-action

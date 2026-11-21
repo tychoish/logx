@@ -517,5 +517,22 @@
           (should (equal (plist-get (car received) :src) custom-src)))
       (logx-unregister-subscriber 'src-test-sub))))
 
+(defun test-logx--sample-caller ()
+  "Sample helper function for backtrace resolution testing."
+  (logx-info :cat 'sample :msg "From caller"))
+
+(ert-deftest test-logx-caller-resolution ()
+  "Verify that emitting from a named function discovers the enclosing function."
+  (let ((received nil))
+    (logx-register-subscriber 'caller-sub (lambda (ev) (push ev received)))
+    (unwind-protect
+        (progn
+          (test-logx--sample-caller)
+          (should received)
+          (let ((src (plist-get (car received) :src)))
+            (should (equal (plist-get src :fn) 'test-logx--sample-caller))))
+      (logx-unregister-subscriber 'caller-sub)
+      (logx-flush))))
+
 (provide 'test-logx)
 ;;; test-logx.el ends here

@@ -269,5 +269,17 @@
             (should (string-match-p "Msg 2" (buffer-string)))))
       (kill-buffer buf))))
 
+(ert-deftest test-logx-view-fn-source-label ()
+  "Verify that source link formats file:fn when line is nil, and does not format file:1."
+  (let* ((rec1 '(:seq 1 :ts 100.0 :lvl info :cat root :msg "test"
+                 :src (:file "test.el" :line nil :fn my-func)))
+         (rec2 '(:seq 2 :ts 100.0 :lvl info :cat root :msg "test"
+                 :src (:file "test.el" :line nil :fn nil)))
+         (rendered1 (logx-view-render-record rec1))
+         (rendered2 (logx-view-render-record rec2)))
+    (should (string-match-p "test\\.el:my-func" rendered1))
+    (should-not (string-match-p "test\\.el:1" rendered1))
+    (should (string-match-p "test\\.el\n" rendered2))))
+
 (provide 'test-logx-view)
 ;;; test-logx-view.el ends here

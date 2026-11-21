@@ -207,13 +207,33 @@ Returns a plist (:file FILE :path PATH :line LINE :fn FN)."
                 ((and (consp byte-compile-current-form)
                       (memq (car byte-compile-current-form) '(defun cl-defun defmacro defalias)))
                  (cadr byte-compile-current-form))))))
-    (when (and (fboundp 'symbol-with-pos-p)
+    ;; 1. Check byte-compilation form stack and buffer
+    (when (and (boundp 'byte-compile-current-buffer)
+               (buffer-live-p byte-compile-current-buffer)
+               (boundp 'byte-compile-form-stack))
+      (let ((offset (and (fboundp 'byte-compile--warning-source-offset)
+                         (byte-compile--warning-source-offset))))
+        (when offset
+          (with-current-buffer byte-compile-current-buffer
+            (setq line (line-number-at-pos offset))))))
+    ;; 2. Check symbol-with-pos on macro-sym
+    (when (and (not line)
+               (fboundp 'symbol-with-pos-p)
                (fboundp 'symbol-with-pos-pos)
                (symbol-with-pos-p macro-sym))
       (let ((pos (symbol-with-pos-pos macro-sym)))
         (when (numberp pos)
-          (setq line (line-number-at-pos pos)))))
-    (unless line
+          (if (and (boundp 'byte-compile-current-buffer)
+                   (buffer-live-p byte-compile-current-buffer))
+              (with-current-buffer byte-compile-current-buffer
+                (setq line (line-number-at-pos pos)))
+            (when (and file (buffer-file-name) (equal file (buffer-file-name)))
+              (setq line (line-number-at-pos pos)))))))
+    ;; 3. Check active buffer ONLY if visiting the same file
+    (when (and (not line)
+               file
+               (buffer-file-name)
+               (equal file (buffer-file-name)))
       (setq line (ignore-errors (line-number-at-pos))))
     (list :file (and file (file-name-nondirectory file))
           :path file
@@ -636,13 +656,51 @@ Returns the number of flushed events."
 
 (defun logx--emit-event (level category msg src data)
   "Construct, store, and dispatch structured event record."
-  (let ((event (list :seq (cl-incf logx--ring-seq)
-                     :ts (float-time)
-                     :lvl level
-                     :cat (or category 'root)
-                     :msg (or msg "")
-                     :src src
-                     :data data)))
+  (let* ((resolved-src
+          (cond
+           ((and src (plist-get src :line) (> (plist-get src :line) 1))
+            src)
+           ((and src (plist-get src :fn) (symbolp (plist-get src :fn)))
+            (let ((loc (ignore-errors (find-function-noselect (plist-get src :fn) t))))
+              (if (and loc (car loc) (cdr loc))
+                  (let ((buf (car loc)) (pos (cdr loc)))
+                    (with-current-buffer buf
+                      (list :file (and (buffer-file-name buf) (file-name-nondirectory (buffer-file-name buf)))
+                            :path (buffer-file-name buf)
+                            :line (line-number-at-pos pos)
+                            :fn (plist-get src :fn))))
+                src)))
+           (t
+            (let ((fn nil) (i 1))
+              (while (and (not fn) (< i 25))
+                (let ((frame (backtrace-frame i)))
+                  (when (and frame (car frame) (symbolp (cadr frame))
+                             (not (string-prefix-p "logx" (symbol-name (cadr frame))))
+                             (not (memq (cadr frame) '(backtrace-frame apply funcall eval))))
+                    (setq fn (cadr frame))))
+                (cl-incf i))
+              (if (and fn (symbolp fn))
+                  (let ((loc (ignore-errors (find-function-noselect fn t))))
+                    (if (and loc (car loc) (cdr loc))
+                        (let ((buf (car loc)) (pos (cdr loc)))
+                          (with-current-buffer buf
+                            (list :file (and (buffer-file-name buf) (file-name-nondirectory (buffer-file-name buf)))
+                                  :path (buffer-file-name buf)
+                                  :line (line-number-at-pos pos)
+                                  :fn fn)))
+                      (let ((sfile (find-lisp-object-file-name fn 'defun)))
+                        (list :file (and sfile (file-name-nondirectory sfile))
+                              :path sfile
+                              :line (and src (plist-get src :line))
+                              :fn fn))))
+                src)))))
+         (event (list :seq (cl-incf logx--ring-seq)
+                      :ts (float-time)
+                      :lvl level
+                      :cat (or category 'root)
+                      :msg (or msg "")
+                      :src resolved-src
+                      :data data)))
     ;; 1. Synchronous core in-memory ring buffer (Primary Ingress)
     (logx--ring-push event)
 
