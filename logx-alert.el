@@ -18,6 +18,7 @@
 
 (require 'logx)
 
+(defvar alert-styles)
 (declare-function alert-define-style "alert" (name &rest args))
 
 ;;;###autoload
@@ -49,8 +50,29 @@
                         :title "Logx Structured Logger"
                         :notifier #'logx-alert-sink)))
 
-(with-eval-after-load 'alert
-  (logx-alert-register))
+;;;###autoload
+(defun logx-alert-deregister ()
+  "Deregister `logx' style from `alert'."
+  (when (boundp 'alert-styles)
+    (setq alert-styles (assoc-delete-all 'logx alert-styles))))
+
+(defun logx-alert--after-load (&rest _)
+  "Register `logx' style once `alert' is loaded."
+  (when (featurep 'alert)
+    (logx-alert-register)
+    (remove-hook 'after-load-functions #'logx-alert--after-load)))
+
+;;;###autoload
+(define-minor-mode logx-alert-mode
+  "Global minor mode to integrate `logx' structured logging with `alert'."
+  :global t
+  :group 'logx
+  (if logx-alert-mode
+      (if (featurep 'alert)
+          (logx-alert-register)
+        (add-hook 'after-load-functions #'logx-alert--after-load))
+    (remove-hook 'after-load-functions #'logx-alert--after-load)
+    (logx-alert-deregister)))
 
 (provide 'logx-alert)
 ;;; logx-alert.el ends here

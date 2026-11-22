@@ -9,6 +9,8 @@
 (require 'logx)
 (require 'logx-alert)
 
+(defvar alert-styles)
+
 (ert-deftest test-logx-alert-sink-severities ()
   "Verify alert severity mapping to logx levels."
   (let ((received nil))
@@ -71,6 +73,40 @@
       (should (equal (car registered) 'logx))
       (should (equal (plist-get (cdr registered) :title) "Logx Structured Logger"))
       (should (equal (plist-get (cdr registered) :notifier) #'logx-alert-sink)))))
+
+(ert-deftest test-logx-alert-deregister ()
+  "Verify deregistration removes logx from alert-styles."
+  (let ((alert-styles '((logx :title "Logx") (other :title "Other"))))
+    (logx-alert-deregister)
+    (should-not (assq 'logx alert-styles))
+    (should (assq 'other alert-styles))))
+
+(ert-deftest test-logx-alert-mode-when-alert-loaded ()
+  "Enabling `logx-alert-mode' registers style when alert is loaded."
+  (let ((logx-alert-mode nil)
+        (registered nil)
+        (alert-styles nil))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feat &rest _) (eq feat 'alert)))
+              ((symbol-function 'alert-define-style)
+               (lambda (name &rest args)
+                 (setq registered (cons name args)))))
+      (logx-alert-mode 1)
+      (should (equal (car registered) 'logx))
+      (logx-alert-mode -1)
+      (should-not logx-alert-mode))))
+
+(ert-deftest test-logx-alert-mode-deferred-and-disable ()
+  "Enabling `logx-alert-mode' adds after-load hook when alert not loaded; disabling cleans up."
+  (let ((logx-alert-mode nil)
+        (after-load-functions nil)
+        (alert-styles '((logx :title "Logx"))))
+    (cl-letf (((symbol-function 'featurep) (lambda (&rest _) nil)))
+      (logx-alert-mode 1)
+      (should (memq #'logx-alert--after-load after-load-functions))
+      (logx-alert-mode -1)
+      (should-not (memq #'logx-alert--after-load after-load-functions))
+      (should-not (assq 'logx alert-styles)))))
 
 (provide 'test-logx-alert)
 ;;; test-logx-alert.el ends here
