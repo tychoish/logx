@@ -199,7 +199,8 @@ eliminating runtime measurement and allocation overhead.")
   "Return non-nil if LEVEL is statically disabled at compile-time.
 When non-nil, macros should expand to a no-op."
   (and (bound-and-true-p logx-compile-time-level)
-       (let ((lvl (logx--canonical-level level)))
+       (let ((lvl (or (logx-canonical-level level)
+                      (logx--canonical-level level))))
          (when lvl
            (< (logx-level-weight lvl)
               (logx-level-weight logx-compile-time-level))))))
@@ -743,15 +744,13 @@ Returns the number of flushed events."
 
 (defun logx--canonical-level (form)
   "Resolve FORM in macro args to a canonical severity symbol.
-Returns nil if not a level. Matches quoted symbols (e.g. \\='info),
-keywords (e.g. :info), and bare severity symbols."
+Returns nil if not a level. Matches quoted symbols (e.g. \\='info)
+and keywords (e.g. :info)."
   (let ((sym (cond
               ((and (consp form) (eq (car form) 'quote) (symbolp (cadr form)))
                (cadr form))
               ((keywordp form)
                (intern (substring (symbol-name form) 1)))
-              ((and (symbolp form) (not (booleanp form)))
-               form)
               (t nil))))
     (and sym (logx-canonical-level sym))))
 
@@ -939,13 +938,18 @@ SPEC is either a string/symbol naming the operation, or a plist:
 Extra keys are included as metadata fields in the log event record.
 Returns a plist (:msg ... :cat ... :level ... :threshold ... :src ... :data ...)."
   (cond
-   ((or (stringp spec) (symbolp spec))
-    (let ((msg (cond
-                ((stringp spec) spec)
-                ((and (consp spec) (eq (car spec) 'quote)) (format "%s" (cadr spec)))
-                (t (symbol-name spec)))))
-      (list :msg msg :cat ''op :level :info :threshold 0.0 :src nil :data nil)))
-   ((consp spec)
+   ;; 1. Quoted symbol '(quote foo)
+   ((and (consp spec) (eq (car spec) 'quote) (symbolp (cadr spec)))
+    (list :msg (symbol-name (cadr spec)) :cat ''op :level :info :threshold 0.0 :src nil :data nil))
+   ;; 2. String literal
+   ((stringp spec)
+    (list :msg spec :cat ''op :level :info :threshold 0.0 :src nil :data nil))
+   ;; 3. Bare symbol (variable or symbol name)
+   ((symbolp spec)
+    (list :msg `(if (stringp ,spec) ,spec (symbol-name ,spec))
+          :cat ''op :level :info :threshold 0.0 :src nil :data nil))
+   ;; 4. Plist (consp starting with keyword)
+   ((and (consp spec) (keywordp (car spec)))
     (let ((args spec)
           (msg nil)
           (cat nil)
@@ -953,9 +957,6 @@ Returns a plist (:msg ... :cat ... :level ... :threshold ... :src ... :data ...)
           (threshold nil)
           (src nil)
           (rest nil))
-      (when (and args (not (keywordp (car args))))
-        (setq msg (car args)
-              args (cdr args)))
       (while args
         (let ((key (car args)))
           (cond
@@ -987,8 +988,9 @@ Returns a plist (:msg ... :cat ... :level ... :threshold ... :src ... :data ...)
             :threshold (or threshold 0.0)
             :src src
             :data (nreverse rest))))
+   ;; 5. Fallback expression
    (t
-    (list :msg "" :cat ''op :level :info :threshold 0.0 :src nil :data nil))))
+    (list :msg spec :cat ''op :level :info :threshold 0.0 :src nil :data nil))))
 
 (defun logx--expand-time (spec body macro-sym)
   "Expand `logx-time' for SPEC, BODY and MACRO-SYM."

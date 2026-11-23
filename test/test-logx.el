@@ -534,5 +534,119 @@
       (logx-unregister-subscriber 'caller-sub)
       (logx-flush))))
 
+(ert-deftest test-logx-time-return-value ()
+  "Verify `logx-time' and `with-logx-time' preserve return values across spec variants."
+  ;; String spec
+  (should (= (logx-time "calc-sum" (+ 10 20)) 30))
+  ;; Symbol spec
+  (should (= (logx-time 'calc-product (* 6 7)) 42))
+  ;; Plist spec
+  (should (equal (logx-time (:cat 'math :msg "calc-list") (list 1 2 3)) '(1 2 3)))
+  ;; Bare keyword spec
+  (should (= (logx-time :msg "bare-kw" (+ 5 5)) 10))
+  ;; with-logx-time alias
+  (should (equal (with-logx-time "alias-test" "result") "result")))
+
+(ert-deftest test-logx-time-elapsed-accuracy ()
+  "Verify `logx-time' measures elapsed execution duration accurately."
+  (let ((received nil))
+    (logx-register-subscriber 'time-acc-sub (lambda (ev) (push ev received)))
+    (unwind-protect
+        (let ((val (logx-time "sleep-op" (sleep-for 0.05) 'done)))
+          (should (eq val 'done))
+          (should (= (length received) 1))
+          (let* ((ev (car received))
+                 (data (plist-get ev :data))
+                 (dur-ms (plist-get data :duration_ms))
+                 (dur-s (plist-get data :duration_s)))
+            (should (equal (plist-get ev :cat) 'op))
+            (should (eq (plist-get ev :lvl) 'info))
+            (should (string-match-p "sleep-op in [0-9.]+ms" (plist-get ev :msg)))
+            (should (numberp dur-ms))
+            (should (>= dur-ms 40.0))
+            (should (numberp dur-s))
+            (should (>= dur-s 0.04))))
+      (logx-unregister-subscriber 'time-acc-sub))))
+
+(ert-deftest test-logx-time-threshold-suppression ()
+  "Verify operations faster than :threshold are omitted from logging."
+  (let ((received nil))
+    (logx-register-subscriber 'time-thresh-sub (lambda (ev) (push ev received)))
+    (unwind-protect
+        (progn
+          ;; Sub-threshold: 1 second threshold vs instantaneous execution
+          (let ((res (logx-time (:msg "quick" :threshold 1.0) (+ 1 2))))
+            (should (= res 3))
+            (should-not received))
+
+          ;; Above threshold: 0.01s threshold vs 0.03s sleep
+          (let ((res (logx-time (:msg "slow" :threshold 0.01) (sleep-for 0.03) 'ok)))
+            (should (eq res 'ok))
+            (should (= (length received) 1))
+            (should (string-match-p "slow in " (plist-get (car received) :msg)))))
+      (logx-unregister-subscriber 'time-thresh-sub))))
+
+(ert-deftest test-logx-time-metadata-passthrough ()
+  "Verify category, level, and arbitrary metadata pass to the event record."
+  (let ((received nil))
+    (logx-register-subscriber 'time-meta-sub (lambda (ev) (push ev received)))
+    (unwind-protect
+        (progn
+          (logx-time (:cat 'benchmarks :level :warn :custom_id "ID-42" :thread 1 :msg "custom-meta")
+            (+ 10 10))
+          (should (= (length received) 1))
+          (let* ((ev (car received))
+                 (data (plist-get ev :data)))
+            (should (equal (plist-get ev :cat) 'benchmarks))
+            (should (eq (plist-get ev :lvl) 'warn))
+            (should (equal (plist-get data :custom_id) "ID-42"))
+            (should (= (plist-get data :thread) 1))
+            (should (numberp (plist-get data :duration_ms)))
+            (should (numberp (plist-get data :duration_s)))))
+      (logx-unregister-subscriber 'time-meta-sub))))
+
+(ert-deftest test-logx-time-error-unwinding ()
+  "Verify errors are recorded with :status 'error and error message while re-signaling."
+  (let ((received nil))
+    (logx-register-subscriber 'time-err-sub (lambda (ev) (push ev received)))
+    (unwind-protect
+        (progn
+          (should-error
+           (logx-time "failing-op"
+             (error "simulated failure in timed block"))
+           :type 'error)
+          (should (= (length received) 1))
+          (let* ((ev (car received))
+                 (data (plist-get ev :data)))
+            (should (string-match-p "failing-op in " (plist-get ev :msg)))
+            (should (eq (plist-get data :status) 'error))
+            (should (equal (plist-get data :error) "simulated failure in timed block"))
+            (should (numberp (plist-get data :duration_ms)))))
+      (logx-unregister-subscriber 'time-err-sub))))
+
+(ert-deftest test-logx-time-zero-cost-expansion ()
+  "Verify compile-time gating produces zero-overhead `progn' expansion."
+  ;; 1. Compile-time disabled: expands to (progn ...) without float-time
+  (let ((logx-compile-time-level 'error))
+    (let ((expanded (macroexpand '(logx-time (:level :info :msg "test") (do-work)))))
+      (should (equal expanded '(progn (do-work))))
+      (should-not (string-match-p "float-time" (format "%S" expanded)))))
+
+  ;; 2. Normal expansion: contains float-time measurement
+  (let ((logx-compile-time-level nil))
+    (let ((expanded (macroexpand '(logx-time (:level :info :msg "test") (do-work)))))
+      (should (string-match-p "float-time" (format "%S" expanded))))))
+
+(ert-deftest test-logx-time-runtime-level-gating ()
+  "Verify runtime level gating suppresses event emission without affecting return value."
+  (let ((received nil)
+        (logx-default-level 'warn))
+    (logx-register-subscriber 'time-gate-sub (lambda (ev) (push ev received)))
+    (unwind-protect
+        (let ((result (logx-time (:level :info :msg "disabled-level") (+ 100 200))))
+          (should (= result 300))
+          (should-not received))
+      (logx-unregister-subscriber 'time-gate-sub))))
+
 (provide 'test-logx)
 ;;; test-logx.el ends here
