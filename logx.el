@@ -1086,6 +1086,13 @@ Execute BODY, measure elapsed time, and log execution duration."
   (declare (indent 1) (debug (sexp body)))
   `(logx-time ,spec ,@body))
 
+;;;###autoload
+(defmacro with-logx-timer (spec &rest body)
+  "Alias for `logx-time'.
+Execute BODY, measure elapsed time, and log execution duration."
+  (declare (indent 1) (debug (sexp body)))
+  `(logx-time ,spec ,@body))
+
 ;;; ----------------------------------------------------------------------------
 ;;; Legacy Message Interception Quarantine Bridge
 ;;; ----------------------------------------------------------------------------

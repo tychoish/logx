@@ -544,8 +544,9 @@
   (should (equal (logx-time (:cat 'math :msg "calc-list") (list 1 2 3)) '(1 2 3)))
   ;; Bare keyword spec
   (should (= (logx-time :msg "bare-kw" (+ 5 5)) 10))
-  ;; with-logx-time alias
-  (should (equal (with-logx-time "alias-test" "result") "result")))
+  ;; with-logx-time and with-logx-timer aliases
+  (should (equal (with-logx-time "alias-test" "result") "result"))
+  (should (equal (with-logx-timer "timer-test" "timer-result") "timer-result")))
 
 (ert-deftest test-logx-time-elapsed-accuracy ()
   "Verify `logx-time' measures elapsed execution duration accurately."
