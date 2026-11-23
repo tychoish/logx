@@ -936,7 +936,8 @@ SPEC is either a string/symbol naming the operation, or a plist:
   :threshold Minimum duration in seconds to trigger logging (default 0.0).
   :src       Explicit source coordinates override.
 Extra keys are included as metadata fields in the log event record.
-Returns a plist (:msg ... :cat ... :level ... :threshold ... :src ... :data ...)."
+Returns a plist:
+(:msg ... :cat ... :level ... :threshold ... :src ... :data ...)."
   (cond
    ;; 1. Quoted symbol '(quote foo)
    ((and (consp spec) (eq (car spec) 'quote) (symbolp (cadr spec)))
