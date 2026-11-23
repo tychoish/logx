@@ -84,6 +84,12 @@
   :type '(alist :key-type (choice symbol string) :value-type symbol)
   :group 'logx)
 
+(defvar logx-compile-time-level nil
+  "When non-nil, minimum severity level required at macro-expansion time.
+Logging or timing forms with a statically known level below this threshold
+expand directly to `nil' (for `logx') or `(progn ,@body)' (for `logx-time'),
+eliminating runtime measurement and allocation overhead.")
+
 (defcustom logx-ring-buffer-size 10000
   "Maximum number of structured events retained in the circular ring buffer."
   :type 'integer
@@ -188,6 +194,15 @@
                              (map-elt logx-category-levels category)))))
          (threshold (or cat-thresh logx-default-level)))
     (>= weight (logx-level-weight threshold))))
+
+(defun logx--zero-cost-p (level &optional _category)
+  "Return non-nil if LEVEL is statically disabled at compile-time.
+When non-nil, macros should expand to a no-op."
+  (and (bound-and-true-p logx-compile-time-level)
+       (let ((lvl (logx--canonical-level level)))
+         (when lvl
+           (< (logx-level-weight lvl)
+              (logx-level-weight logx-compile-time-level))))))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Call-Site Capture
@@ -728,13 +743,15 @@ Returns the number of flushed events."
 
 (defun logx--canonical-level (form)
   "Resolve FORM in macro args to a canonical severity symbol.
-Returns nil if not a level. Matches quoted symbols (e.g. \\='info)
-and keywords (e.g. :info)."
+Returns nil if not a level. Matches quoted symbols (e.g. \\='info),
+keywords (e.g. :info), and bare severity symbols."
   (let ((sym (cond
               ((and (consp form) (eq (car form) 'quote) (symbolp (cadr form)))
                (cadr form))
               ((keywordp form)
                (intern (substring (symbol-name form) 1)))
+              ((and (symbolp form) (not (booleanp form)))
+               form)
               (t nil))))
     (and sym (logx-canonical-level sym))))
 
@@ -778,7 +795,9 @@ it is treated as the positional log message."
 (defun logx--expand-macro (level args macro-sym)
   "Expand logging macro for LEVEL with ARGS and MACRO-SYM.
 When LEVEL is nil, dynamically evaluates `logx-default-event-level' at runtime."
-  (let* ((parsed (logx--parse-macro-args args))
+  (if (and level (logx--zero-cost-p level))
+      nil
+    (let* ((parsed (logx--parse-macro-args args))
          (cat-form (plist-get parsed :cat))
          (msg-form (plist-get parsed :msg))
          (src-form (plist-get parsed :src))
@@ -840,7 +859,7 @@ When LEVEL is nil, dynamically evaluates `logx-default-event-level' at runtime."
                                     logx-default-event-level)
                                'debug)))
              (when (logx--level-enabled-p ,lvl-sym ,cat-form)
-               ,(funcall body-fn cat-form)))))))))
+               ,(funcall body-fn cat-form))))))))))
 
 ;;;###autoload
 (defmacro logx (&rest args)
@@ -904,6 +923,165 @@ ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs."
   "Emit a FATAL level log event.
 ARGS can include :cat CATEGORY, :msg MESSAGE, and arbitrary KEY VALUE pairs."
   (logx--expand-macro 'fatal args 'logx-fatal))
+
+;;; ----------------------------------------------------------------------------
+;;; Timing Telemetry (logx-time)
+;;; ----------------------------------------------------------------------------
+
+(defun logx--parse-time-spec (spec)
+  "Parse SPEC for `logx-time'.
+SPEC is either a string/symbol naming the operation, or a plist:
+  :msg       Operation description string.
+  :cat       Category symbol (default \\='op).
+  :level     Log level keyword (default :info).
+  :threshold Minimum duration in seconds to trigger logging (default 0.0).
+  :src       Explicit source coordinates override.
+Extra keys are included as metadata fields in the log event record.
+Returns a plist (:msg ... :cat ... :level ... :threshold ... :src ... :data ...)."
+  (cond
+   ((or (stringp spec) (symbolp spec))
+    (let ((msg (cond
+                ((stringp spec) spec)
+                ((and (consp spec) (eq (car spec) 'quote)) (format "%s" (cadr spec)))
+                (t (symbol-name spec)))))
+      (list :msg msg :cat ''op :level :info :threshold 0.0 :src nil :data nil)))
+   ((consp spec)
+    (let ((args spec)
+          (msg nil)
+          (cat nil)
+          (level nil)
+          (threshold nil)
+          (src nil)
+          (rest nil))
+      (when (and args (not (keywordp (car args))))
+        (setq msg (car args)
+              args (cdr args)))
+      (while args
+        (let ((key (car args)))
+          (cond
+           ((memq key '(:msg :message :name))
+            (setq msg (cadr args)
+                  args (cddr args)))
+           ((memq key '(:cat :category :domain))
+            (setq cat (cadr args)
+                  args (cddr args)))
+           ((memq key '(:level :lvl :severity))
+            (setq level (cadr args)
+                  args (cddr args)))
+           ((memq key '(:threshold :thresh))
+            (setq threshold (cadr args)
+                  args (cddr args)))
+           ((memq key '(:src :source :caller))
+            (setq src (cadr args)
+                  args (cddr args)))
+           ((keywordp key)
+            (push key rest)
+            (push (cadr args) rest)
+            (setq args (cddr args)))
+           (t
+            (push key rest)
+            (setq args (cdr args))))))
+      (list :msg (or msg "")
+            :cat (or cat ''op)
+            :level (or level :info)
+            :threshold (or threshold 0.0)
+            :src src
+            :data (nreverse rest))))
+   (t
+    (list :msg "" :cat ''op :level :info :threshold 0.0 :src nil :data nil))))
+
+(defun logx--expand-time (spec body macro-sym)
+  "Expand `logx-time' for SPEC, BODY and MACRO-SYM."
+  (let* ((parsed (logx--parse-time-spec spec))
+         (msg-form (plist-get parsed :msg))
+         (cat-form (plist-get parsed :cat))
+         (lvl-form (plist-get parsed :level))
+         (thresh-form (plist-get parsed :threshold))
+         (src-form (plist-get parsed :src))
+         (data-forms (plist-get parsed :data))
+         (src (logx--capture-call-site macro-sym))
+         (canonical-lvl (logx--canonical-level lvl-form)))
+    (if (and canonical-lvl (logx--zero-cost-p canonical-lvl cat-form))
+        `(progn ,@body)
+      (let ((start-sym (gensym "start-time-"))
+            (err-sym (gensym "err-val-"))
+            (result-sym (gensym "result-"))
+            (duration-sym (gensym "duration-"))
+            (thresh-sym (gensym "threshold-"))
+            (cat-sym (gensym "cat-"))
+            (lvl-sym (gensym "lvl-"))
+            (msg-sym (gensym "msg-"))
+            (src-sym (gensym "src-")))
+        `(let ((,lvl-sym ,(if canonical-lvl `',canonical-lvl `(or (logx--canonical-level ,lvl-form) 'info)))
+               (,cat-sym ,cat-form))
+           (if (not (logx--level-enabled-p ,lvl-sym ,cat-sym))
+               (progn ,@body)
+             (let ((,thresh-sym ,thresh-form)
+                   (,start-sym (float-time))
+                   (,err-sym nil)
+                   (,result-sym nil))
+               (unwind-protect
+                   (condition-case err
+                       (setq ,result-sym (progn ,@body))
+                     (error
+                      (setq ,err-sym err)
+                      (signal (car err) (cdr err))))
+                 (let ((,duration-sym (- (float-time) ,start-sym)))
+                   (when (>= ,duration-sym (or ,thresh-sym 0.0))
+                     (let* ((,msg-sym ,msg-form)
+                            (,src-sym ,(if src-form `(or ,src-form ',src) `',src))
+                            (dur-ms (* ,duration-sym 1000.0))
+                            (formatted-msg
+                             (if (and (stringp ,msg-sym) (not (string-empty-p ,msg-sym)))
+                                 (format "%s in %.2fms" ,msg-sym dur-ms)
+                               (format "executed in %.2fms" dur-ms)))
+                            (event-data
+                             (append
+                              (list :duration_ms dur-ms
+                                    :duration_s ,duration-sym)
+                              (when ,err-sym
+                                (list :status 'error
+                                      :error (error-message-string ,err-sym)))
+                              (list ,@data-forms))))
+                       (logx--emit-event ,lvl-sym
+                                         ,cat-sym
+                                         formatted-msg
+                                         ,src-sym
+                                         event-data))))))))))))
+
+;;;###autoload
+(defmacro logx-time (spec &rest body)
+  "Execute BODY, measure elapsed time, and log execution duration.
+
+SPEC is either a string/symbol naming the operation, or a plist:
+  :msg       Operation description string.
+  :cat       Category symbol (default \\='op).
+  :level     Log level keyword (default :info).
+  :threshold Minimum duration in seconds to trigger logging (default 0.0).
+  :src       Explicit source coordinates override.
+  Extra keys are included as metadata fields in the log event record.
+
+Returns the evaluation result of the last form in BODY."
+  (declare (indent 1) (debug (sexp body)))
+  (let* ((actual-spec spec)
+         (actual-body body))
+    (when (keywordp spec)
+      (let ((all (cons spec body))
+            (plist nil))
+        (while (and all (keywordp (car all)))
+          (push (car all) plist)
+          (push (cadr all) plist)
+          (setq all (cddr all)))
+        (setq actual-spec (nreverse plist)
+              actual-body all)))
+    (logx--expand-time actual-spec actual-body 'logx-time)))
+
+;;;###autoload
+(defmacro with-logx-time (spec &rest body)
+  "Alias for `logx-time'.
+Execute BODY, measure elapsed time, and log execution duration."
+  (declare (indent 1) (debug (sexp body)))
+  `(logx-time ,spec ,@body))
 
 ;;; ----------------------------------------------------------------------------
 ;;; Legacy Message Interception Quarantine Bridge
